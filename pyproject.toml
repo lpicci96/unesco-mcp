@@ -24,7 +24,13 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = []
+dependencies = [
+    "fastmcp>=3.0.0rc1",
+    "unesco-reader>=3.0.0",
+]
+
+[project.scripts]
+unesco-mcp = "unesco_mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/lucapicci/unesco-mcp"

@@ -2,10 +2,26 @@
 
 import sqlite3
 from contextlib import contextmanager
-import json
+from pathlib import Path
+
 import unesco_reader as uis
 
-DB_PATH = "uis.db"
+DB_PATH = Path(__file__).parent / "uis.db"
+
+
+@contextmanager
+def _get_connection():
+    """Yield a SQLite connection with foreign keys enabled, auto-commit/rollback, and guaranteed close."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _indicators_table():
@@ -27,13 +43,13 @@ def _indicators_table():
 def _disaggregations_type_table():
     """Return CREATE TABLE statement for the disaggregation_types table."""
 
-    return ('''
+    return '''
                    CREATE TABLE IF NOT EXISTS disaggregation_types
                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
                     type_code TEXT NOT NULL UNIQUE,
                     type_name TEXT NOT NULL UNIQUE
                    )
-                   ''')
+                   '''
 
 
 def _disaggregations_values_table():
@@ -82,40 +98,38 @@ def _indexes():
 def init_db():
     """Create all tables and indexes if they don't already exist."""
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    with _get_connection() as conn:
+        cursor = conn.cursor()
 
-    cursor.execute(_indicators_table()) # Indicators table
-    cursor.execute(_disaggregations_type_table()) # Disaggregation types table
-    cursor.execute(_disaggregations_values_table()) # Disaggregation values table
-    cursor.execute(_indicator_disaggregations_table()) # Indicator-disaggregation mappings
+        cursor.execute(_indicators_table())
+        cursor.execute(_disaggregations_type_table())
+        cursor.execute(_disaggregations_values_table())
+        cursor.execute(_indicator_disaggregations_table())
 
-    for idx in _indexes():
-        cursor.execute(idx)
+        for idx in _indexes():
+            cursor.execute(idx)
 
-    conn.commit()
-    conn.close()
 
 def store_indicators():
     """Store indicators in the database."""
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
     indicators_df = uis.available_indicators()
 
-    for _, row in indicators_df.iterrows():
-        cursor.execute("""
-                       INSERT OR REPLACE INTO indicators
-                       (code, name, theme, lastDataUpdate,
-                        timeLine_min, timeLine_max, totalRecordCount, geoUnitType)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                       """, (row["indicatorCode"], row["name"], row["theme"],
-                             str(row["lastDataUpdate"]),
-                             int(row["timeLine_min"]), int(row["timeLine_max"]),
-                             int(row["totalRecordCount"]), row["geoUnitType"]))
+    rows = [
+        (row["indicatorCode"], row["name"], row["theme"],
+         str(row["lastDataUpdate"]),
+         int(row["timeLine_min"]), int(row["timeLine_max"]),
+         int(row["totalRecordCount"]), row["geoUnitType"])
+        for _, row in indicators_df.iterrows()
+    ]
 
-    conn.commit()
+    with _get_connection() as conn:
+        conn.executemany("""
+            INSERT OR REPLACE INTO indicators
+            (code, name, theme, lastDataUpdate,
+             timeLine_min, timeLine_max, totalRecordCount, geoUnitType)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
 
 
 def get_disaggregations() -> dict:
@@ -125,116 +139,159 @@ def get_disaggregations() -> dict:
 
     for i in uis.api.get_indicators(disaggregations=True):
 
-        if "disaggregations" in i:
+        if "disaggregations" not in i:
+            continue
 
-            for j in i["disaggregations"]:
-                dis_type_code = j["disaggregationType"]["code"]  # disaggregation type code
-                dis_type_name = j["disaggregationType"]["name"]  # disaggregation type name
+        for j in i["disaggregations"]:
+            dis_type_code = j["disaggregationType"]["code"]
+            dis_type_name = j["disaggregationType"]["name"]
 
-                dis_code = j["code"]
-                dis_name = j["name"]
+            dis_code = j["code"]
+            dis_name = j["name"]
 
-                if "glossaryTerms" in j and len(j["glossaryTerms"]) > 0:
-                    dis_definition = j["glossaryTerms"][0]
-                    if "definition" in dis_definition:
-                        dis_definition = dis_definition["definition"]
-                    else:
-                        dis_definition = None
-                else:
-                    dis_definition = None
+            dis_definition = None
+            if "glossaryTerms" in j and len(j["glossaryTerms"]) > 0:
+                term = j["glossaryTerms"][0]
+                if "definition" in term:
+                    dis_definition = term["definition"]
 
-                if dis_type_code not in disaggregations:
-                    disaggregations[dis_type_code] = {"name": dis_type_name, "disaggregations": {}}
+            if dis_type_code not in disaggregations:
+                disaggregations[dis_type_code] = {"name": dis_type_name, "disaggregations": {}}
 
-                if dis_code not in disaggregations[dis_type_code]["disaggregations"]:
-                    disaggregations[dis_type_code]["disaggregations"][dis_code] = {"name": dis_name,
-                                                                                   "definition": dis_definition}
+            if dis_code not in disaggregations[dis_type_code]["disaggregations"]:
+                disaggregations[dis_type_code]["disaggregations"][dis_code] = {"name": dis_name,
+                                                                               "definition": dis_definition}
     return disaggregations
 
 
-def store_disaggregation_types():
-    """Fetch disaggregation types from the UIS API and store them in the database."""
+def store_disaggregation_types(disaggregations: dict):
+    """Store disaggregation types in the database."""
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    rows = [(code, item["name"]) for code, item in disaggregations.items()]
 
-    disaggregations = [{"code": code, "name": item["name"]}
-                       for code, item in get_disaggregations().items()]
-
-    for dis in disaggregations:
-        cursor.execute("""
-                       INSERT OR REPLACE INTO disaggregation_types
-                       (type_code, type_name)
-                       VALUES (?, ?)
-                       """, (dis["code"], dis["name"]))
-
-    conn.commit()
+    with _get_connection() as conn:
+        conn.executemany("""
+            INSERT OR REPLACE INTO disaggregation_types
+            (type_code, type_name)
+            VALUES (?, ?)
+            """, rows)
 
 
-def store_disaggregation_values():
-    """Fetch disaggregation values from the UIS API and store them in the database."""
+def store_disaggregation_values(disaggregations: dict):
+    """Store disaggregation values in the database."""
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    rows = [
+        (type_code, dis_code, vals["name"], vals["definition"])
+        for type_code, values in disaggregations.items()
+        for dis_code, vals in values["disaggregations"].items()
+    ]
 
-    disaggregations = []
-    for type_code, values in get_disaggregations().items():
-        for dis_code in values["disaggregations"]:
-            disaggregations.append({
-                "type_code": type_code,
-                "dis_code": dis_code,
-                "dis_name": values["disaggregations"][dis_code]["name"],
-                "dis_definition": values["disaggregations"][dis_code]["definition"]
-            })
-
-    for dis in disaggregations:
-        cursor.execute("""
-                       INSERT OR REPLACE INTO disaggregation_values
-                       (type_id, code, name, description)
-                       VALUES (
-                           (SELECT id FROM disaggregation_types WHERE type_code = ?),
-                           ?, ?, ?
-                          )
-                          """, (dis["type_code"], dis["dis_code"], dis["dis_name"], dis["dis_definition"]))
-
-    conn.commit()
+    with _get_connection() as conn:
+        conn.executemany("""
+            INSERT OR REPLACE INTO disaggregation_values
+            (type_id, code, name, description)
+            VALUES (
+                (SELECT id FROM disaggregation_types WHERE type_code = ?),
+                ?, ?, ?
+               )
+            """, rows)
 
 
 def store_indicator_disaggregations():
     """Fetch indicator-disaggregation mappings from the UIS API and store them in the database."""
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    rows = [
+        (i["indicatorCode"], disaggregation["code"])
+        for i in uis.api.get_indicators(disaggregations=True)
+        for disaggregation in i.get("disaggregations", [])
+    ]
 
-    indicators = []
-    for i in uis.api.get_indicators(disaggregations=True):
-        for disaggregation in i["disaggregations"]:
-            indicators.append({
-                "indicator_code": i["indicatorCode"],
-                "dis_code": disaggregation["code"],
-            })
-
-    for item in indicators:
-        cursor.execute("""
-                       INSERT OR REPLACE INTO indicator_disaggregations
-                       (indicator_code, disaggregation_id)
-                       VALUES (
-                           ?,
-                           (SELECT id FROM disaggregation_values WHERE code = ?)
-                          )
-                          """, (item["indicator_code"], item["dis_code"]))
-
-    conn.commit()
+    with _get_connection() as conn:
+        conn.executemany("""
+            INSERT OR REPLACE INTO indicator_disaggregations
+            (indicator_code, disaggregation_id)
+            VALUES (
+                ?,
+                (SELECT id FROM disaggregation_values WHERE code = ?)
+               )
+            """, rows)
 
 
-def build_db():
-    """Initialize the database and populate all tables."""
+# ── Query helpers ──────────────────────────────────────────────────────────
 
+
+def query(sql: str, params: tuple = ()) -> list[dict]:
+    """Run a read-only query and return results as a list of dicts."""
+    with _get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_indicators(theme: str | None = None) -> list[dict]:
+    """Return indicators, optionally filtered by theme code."""
+    if theme:
+        return query("SELECT * FROM indicators WHERE theme = ?", (theme,))
+    return query("SELECT * FROM indicators")
+
+
+def get_indicator(code: str) -> dict | None:
+    """Return a single indicator by code, or None."""
+    rows = query("SELECT * FROM indicators WHERE code = ?", (code,))
+    return rows[0] if rows else None
+
+
+def search_indicators(term: str) -> list[dict]:
+    """Search indicators by name (case-insensitive LIKE)."""
+    return query("SELECT * FROM indicators WHERE name LIKE ?", (f"%{term}%",))
+
+
+def get_disaggregations_for_indicator(indicator_code: str) -> list[dict]:
+    """Return disaggregation values linked to a given indicator."""
+    return query("""
+        SELECT dv.code, dv.name, dv.description, dt.type_code, dt.type_name
+        FROM indicator_disaggregations id
+        JOIN disaggregation_values dv ON dv.id = id.disaggregation_id
+        JOIN disaggregation_types dt ON dt.id = dv.type_id
+        WHERE id.indicator_code = ?
+        """, (indicator_code,))
+
+
+# ── Build ──────────────────────────────────────────────────────────────────
+
+
+def ensure_db():
+    """Build the database if it doesn't exist or is empty."""
+    if not DB_PATH.exists():
+        build_db()
+        return
+    with _get_connection() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
+    if count == 0:
+        build_db()
+
+
+def build_db(fresh: bool = False):
+    """Initialize the database and populate all tables.
+
+    Args:
+        fresh: If True, delete the existing database and rebuild from scratch.
+    """
+
+    if fresh:
+        teardown_db()
     init_db()
     store_indicators()
-    store_disaggregation_types()
-    store_disaggregation_values()
+
+    disaggregations = get_disaggregations()
+    store_disaggregation_types(disaggregations)
+    store_disaggregation_values(disaggregations)
     store_indicator_disaggregations()
+
+
+def teardown_db():
+    """Remove the database file if it exists."""
+    DB_PATH.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

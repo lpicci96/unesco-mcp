@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from rapidfuzz import fuzz
 import unesco_reader as uis
 
 DB_PATH = Path(__file__).parent / "uis.db"
@@ -218,57 +219,126 @@ def store_indicator_disaggregations():
 
 
 # ── Query helpers ──────────────────────────────────────────────────────────
-
-
+#
+#
 def query(sql: str, params: tuple = ()) -> list[dict]:
     """Run a read-only query and return results as a list of dicts."""
     with _get_connection() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+#
+#
+# def get_indicators(theme: str | None = None) -> list[dict]:
+#     """Return indicators, optionally filtered by theme code."""
+#     if theme:
+#         return query("SELECT * FROM indicators WHERE theme = ?", (theme,))
+#     return query("SELECT * FROM indicators")
+#
+#
+# def get_indicator(code: str) -> dict | None:
+#     """Return a single indicator by code, or None."""
+#     rows = query("SELECT * FROM indicators WHERE code = ?", (code,))
+#     return rows[0] if rows else None
+#
+#
+# def search_indicators(term: str) -> list[dict]:
+#     """Search indicators by name (case-insensitive LIKE)."""
+#     return query("SELECT * FROM indicators WHERE name LIKE ?", (f"%{term}%",))
+#
+#
+# def get_disaggregations_for_indicator(indicator_code: str) -> list[dict]:
+#     """Return disaggregation values linked to a given indicator."""
+#     return query("""
+#         SELECT dv.code, dv.name, dv.description, dt.type_code, dt.type_name
+#         FROM indicator_disaggregations id
+#         JOIN disaggregation_values dv ON dv.id = id.disaggregation_id
+#         JOIN disaggregation_types dt ON dt.id = dv.type_id
+#         WHERE id.indicator_code = ?
+#         """, (indicator_code,))
 
 
-def get_indicators(theme: str | None = None) -> list[dict]:
-    """Return indicators, optionally filtered by theme code."""
-    if theme:
-        return query("SELECT * FROM indicators WHERE theme = ?", (theme,))
-    return query("SELECT * FROM indicators")
+MAX_RESULTS = 20
+FUZZY_SCORE_THRESHOLD = 60
 
 
-def get_indicator(code: str) -> dict | None:
-    """Return a single indicator by code, or None."""
-    rows = query("SELECT * FROM indicators WHERE code = ?", (code,))
-    return rows[0] if rows else None
+def _fuzzy_filter(indicators: list[dict], query_term: str) -> list[dict]:
+    """Score indicators by name relevance and return those above threshold, sorted by score."""
+    scored = [
+        (ind, fuzz.WRatio(query_term, ind["name"]))
+        for ind in indicators
+    ]
+    return [
+        ind for ind, score in sorted(scored, key=lambda x: x[1], reverse=True)
+        if score >= FUZZY_SCORE_THRESHOLD
+    ]
 
 
-def search_indicators(term: str) -> list[dict]:
-    """Search indicators by name (case-insensitive LIKE)."""
-    return query("SELECT * FROM indicators WHERE name LIKE ?", (f"%{term}%",))
+def search_indicators(
+    query_term: str | None = None,
+    theme: str | None = None,
+    disaggregation_types: list[str] | None = None,
+    disaggregation_values: list[str] | None = None,
+) -> list[dict]:
+    """Search indicators with structured filters, optionally ranked by fuzzy text match.
 
+    Structured filters (theme, disaggregation_types, disaggregation_values) are applied
+    in SQL. If query_term is provided, results are then scored and filtered using fuzzy
+    matching on indicator name, and returned sorted by relevance.
 
-def get_disaggregations_for_indicator(indicator_code: str) -> list[dict]:
-    """Return disaggregation values linked to a given indicator."""
-    return query("""
-        SELECT dv.code, dv.name, dv.description, dt.type_code, dt.type_name
-        FROM indicator_disaggregations id
-        JOIN disaggregation_values dv ON dv.id = id.disaggregation_id
-        JOIN disaggregation_types dt ON dt.id = dv.type_id
-        WHERE id.indicator_code = ?
-        """, (indicator_code,))
+    The two disaggregation filters are independent:
+    - disaggregation_types: indicators must have at least one value from EACH listed type
+    - disaggregation_values: indicators must have ALL listed specific value codes
+
+    Args:
+        query_term: Fuzzy match on indicator name, applied as a post-filter.
+        theme: Exact match on theme code.
+        disaggregation_types: Filter for broad disaggregation types (e.g. ["SEX", "AGE"]).
+        disaggregation_values: Filter for specific disaggregation value codes (e.g. ["M", "F"]).
+
+    Returns:
+        List of matching indicator dicts, sorted by relevance when query_term is used.
+    """
+    conditions: list[str] = []
+    params: list[str | int] = []
+
+    if theme is not None:
+        conditions.append("i.theme = ?")
+        params.append(theme)
+
+    # Each type gets its own EXISTS subquery — indicator must have at least one value per type
+    if disaggregation_types:
+        for type_code in disaggregation_types:
+            conditions.append("""EXISTS (
+                SELECT 1 FROM indicator_disaggregations id_dt
+                JOIN disaggregation_values dv_dt ON dv_dt.id = id_dt.disaggregation_id
+                JOIN disaggregation_types dt ON dt.id = dv_dt.type_id
+                WHERE id_dt.indicator_code = i.code AND dt.type_code = ?
+            )""")
+            params.append(type_code)
+
+    # Values filter: indicator must have ALL listed value codes
+    if disaggregation_values:
+        placeholders = ", ".join("?" for _ in disaggregation_values)
+        conditions.append(f"""(
+            SELECT COUNT(DISTINCT dv.code)
+            FROM indicator_disaggregations id_dv
+            JOIN disaggregation_values dv ON dv.id = id_dv.disaggregation_id
+            WHERE id_dv.indicator_code = i.code AND dv.code IN ({placeholders})
+        ) = {len(disaggregation_values)}""")
+        params.extend(disaggregation_values)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    sql = f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max, i.totalRecordCount FROM indicators i {where}"
+    results = query(sql, tuple(params))
+
+    if query_term is not None:
+        results = _fuzzy_filter(results, query_term)
+
+    return results
 
 
 # ── Build ──────────────────────────────────────────────────────────────────
-
-
-def ensure_db():
-    """Build the database if it doesn't exist or is empty."""
-    if not DB_PATH.exists():
-        build_db()
-        return
-    with _get_connection() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
-    if count == 0:
-        build_db()
 
 
 def build_db(fresh: bool = False):

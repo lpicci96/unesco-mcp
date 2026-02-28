@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "fastmcp>=3.0.0rc1",
+    "rapidfuzz>=3.14.3",
     "unesco-reader",
 ]
 

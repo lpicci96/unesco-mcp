@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastmcp import FastMCP
 import unesco_reader as uis
 
-from unesco_mcp.indicator_db import build_db, teardown_db, query as db_query, search_indicators as db_search_indicators, MAX_RESULTS
+from unesco_mcp.indicator_db import build_db, teardown_db, query as db_query, search_indicators as db_search_indicators, MAX_RESULTS, MAX_RESULTS_CAP
 
 
 @asynccontextmanager
@@ -168,74 +168,90 @@ async def get_disaggregation_values(type_code: str) -> dict:
         "count": len(values),
     }
 
-# TODO: add additional filters eg time coverage, geo units, latest update date etc
 @mcp.tool()
 async def search_indicators(
     query: str | None = None,
     theme: str | None = None,
     disaggregation_types: list[str] | None = None,
     disaggregation_values: list[str] | None = None,
+    min_year: int | None = None,
+    max_year: int | None = None,
+    updated_since: str | None = None,
+    limit: int = MAX_RESULTS,
 ) -> dict:
     """Search UNESCO UIS indicators using structured filters and optional text matching.
 
-    IMPORTANT — REQUIRED WORKFLOW:
-    1. Call list_disaggregation_types and get_disaggregation_values to map user concepts
-       (e.g. "primary education", "female", "rural") to exact codes BEFORE using this tool.
-    2. Call list_themes if the user mentions a thematic area (e.g. "SDG", "education").
-    3. Pass the discovered codes as structured filters (theme, disaggregation_types, disaggregation_values).
-    4. Only use the query parameter for additional name-based narrowing AFTER applying structured filters,
-       or when the user's request genuinely has no matching disaggregation type or theme.
+    IMPORTANT - SUGGESTED WORKFLOW:
+    1. Call list_themes if the user mentions a thematic area (e.g. "education", "culture") to find the exact theme code.
+    2. Call list_disaggregation_types to find relevant disaggregation type codes for user concepts like "sex", and
+        "education level". Then call get_disaggregation_values for each type to find the exact value codes for concepts like "female"
+        or "primary education". DO NOT pass concepts like "primary education" or "female" as the query parameter —
+        these are disaggregation values and should be looked up and passed as disaggregation_values for accurate
+        results.
+    3. Pass the discovered theme code, disaggregation type codes, and disaggregation value codes as structured filters
+     to this search_indicators tool.
+    4. Use the additional filters for other refinement (e.g. if the user also mentioned a year range)
+    5. Only use the query parameter for additional name-based narrowing AFTER applying structured filters,
+      or when the user's request genuinely has no matching disaggregation type or theme.
 
-    DO NOT pass concepts like "primary education" or "female" as the query parameter —
-    these are disaggregation values and must be looked up and passed as disaggregation_values.
+    The total results found are not absolute. There may be some results that don't fully match the user's
+    search, or some indicators that didn't make it into the results. Always report the findings back to the user
+    accurately and transparently, and suggest next steps for refining the search if needed.
 
-    The two disaggregation filters are independent:
-    - disaggregation_types: indicators must have at least one value from EACH listed type
-    - disaggregation_values: indicators must have ALL listed specific value codes
 
-    All provided filters are combined with AND logic. At least one parameter must be provided.
-    Results are capped at 20. If more exist, tell the user the total count and suggest
-    narrowing with additional filters rather than trying to show all results.
+    All provided filters are combined with AND logic. At least one filter parameter must be provided.
+    Results default to 20. If more exist, tell the user the total count and suggest
+    narrowing with additional filters rather than increasing the limit.
 
     Args:
-        query: Fuzzy match on indicator name. Secondary refinement only — do not use for concepts that map to themes or disaggregations.
+        query: Full-text search on indicator name (supports stemming, e.g. "completing" matches "completion"). Secondary refinement only — do not use for concepts that map to themes or disaggregations.
         theme: Exact theme code (from list_themes).
         disaggregation_types: List of disaggregation type codes (from list_disaggregation_types). Indicators must support ALL listed types.
         disaggregation_values: List of disaggregation value codes (from get_disaggregation_values). Indicators must match ALL listed values.
+        min_year: Earliest year needed. Only returns indicators whose time coverage starts at or before this year.
+        max_year: Latest year needed. Only returns indicators whose time coverage extends to or beyond this year.
+        updated_since: ISO date (e.g. "2024-01-01"). Only returns indicators updated on or after this date.
+        limit: Maximum number of results to return (default 20, max 50). Prefer narrowing filters over increasing limit.
 
     Returns:
         A dictionary with:
             - "indicators": List of matching indicators (code, name, theme, timeLine_min, timeLine_max, totalRecordCount).
-            - "total": Total number of matching indicators.
-            - "returned": Number of indicators returned (capped at 20).
+            - "total found": Total number of potentially matching indicators.
+            - "total returned": Number of indicators returned.
             - "hint": Guidance on next steps.
     """
-    if not any([query, theme, disaggregation_types, disaggregation_values]):
-        return {"error": "At least one parameter must be provided. Use theme, disaggregation_types, or disaggregation_values to filter, and optionally query to search by name."}
+    if not any([query, theme, disaggregation_types, disaggregation_values, min_year, max_year, updated_since]):
+        return {"error": "At least one filter parameter must be provided."}
+
+    effective_limit = min(max(limit, 1), MAX_RESULTS_CAP)
 
     all_results = db_search_indicators(
         query_term=query,
         theme=theme,
         disaggregation_types=disaggregation_types,
         disaggregation_values=disaggregation_values,
+        min_year=min_year,
+        max_year=max_year,
+        updated_since=updated_since,
     )
 
     total = len(all_results)
-    truncated = total > MAX_RESULTS
-    results = all_results[:MAX_RESULTS]
+    truncated = total > effective_limit
+    results = all_results[:effective_limit]
 
     hint = "Use indicator codes to retrieve data."
     if truncated:
         hint += (
-            f" Showing {MAX_RESULTS} of {total} total matches."
-            " Tell the user how many exist and suggest narrowing with additional filters"
-            " (theme, disaggregation_types, disaggregation_values, query) rather than listing all results."
+            f" Showing {effective_limit} of {total} total matches."
+            " Tell the user how many were found and suggest narrowing with additional filters"
+            " (theme, disaggregation_types, disaggregation_values, query, min_year, max_year, updated_since)"
+            " rather than increasing the limit."
         )
 
     return {
         "indicators": results,
-        "total": total,
-        "returned": len(results),
+        "total found": total,
+        "total returned": len(results),
         "hint": hint,
     }
 

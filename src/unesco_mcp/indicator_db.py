@@ -238,9 +238,6 @@ def store_indicator_disaggregations():
             """, rows)
 
 
-# ── Query helpers ──────────────────────────────────────────────────────────
-#
-#
 def query(sql: str, params: tuple = ()) -> list[dict]:
     """Run a read-only query and return results as a list of dicts."""
     with _get_connection() as conn:

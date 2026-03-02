@@ -246,14 +246,62 @@ def query(sql: str, params: tuple = ()) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def _build_indicator_conditions(
+    theme: str | None = None,
+    disaggregation_types: list[str] | None = None,
+    disaggregation_values: list[str] | None = None,
+    coverage_start_year: int | None = None,
+    coverage_end_year: int | None = None,
+    updated_since: str | None = None,
+) -> tuple[list[str], list[str | int]]:
+    """Build WHERE conditions and params for indicator filters (no FTS)."""
+    conditions: list[str] = []
+    params: list[str | int] = []
+
+    if theme is not None:
+        conditions.append("i.theme = ?")
+        params.append(theme)
+
+    if coverage_start_year is not None:
+        conditions.append("i.timeLine_min <= ?")
+        params.append(coverage_start_year)
+
+    if coverage_end_year is not None:
+        conditions.append("i.timeLine_max >= ?")
+        params.append(coverage_end_year)
+
+    if updated_since is not None:
+        conditions.append("i.lastDataUpdate >= ?")
+        params.append(updated_since)
+
+    if disaggregation_types:
+        for type_code in disaggregation_types:
+            conditions.append("""EXISTS (
+                SELECT 1 FROM indicator_disaggregations id_dt
+                JOIN disaggregation_values dv_dt ON dv_dt.id = id_dt.disaggregation_id
+                JOIN disaggregation_types dt ON dt.id = dv_dt.type_id
+                WHERE id_dt.indicator_code = i.code AND dt.type_code = ?
+            )""")
+            params.append(type_code)
+
+    if disaggregation_values:
+        placeholders = ", ".join("?" for _ in disaggregation_values)
+        conditions.append(f"""(
+            SELECT COUNT(DISTINCT dv.id)
+            FROM indicator_disaggregations id_dv
+            JOIN disaggregation_values dv ON dv.id = id_dv.disaggregation_id
+            WHERE id_dv.indicator_code = i.code AND dv.code IN ({placeholders})
+        ) = {len(disaggregation_values)}""")
+        params.extend(disaggregation_values)
+
+    return conditions, params
+
+
 def search_indicators(
     query_term: str | None = None,
     theme: str | None = None,
     disaggregation_types: list[str] | None = None,
     disaggregation_values: list[str] | None = None,
-    min_year: int | None = None,
-    max_year: int | None = None,
-    updated_since: str | None = None,
 ) -> list[dict]:
     """Search indicators with structured filters and optional FTS5 text matching.
 
@@ -270,15 +318,15 @@ def search_indicators(
         theme: Exact match on theme code.
         disaggregation_types: Filter for broad disaggregation types (e.g. ["SEX", "AGE"]).
         disaggregation_values: Filter for specific disaggregation value codes (e.g. ["M", "F"]).
-        min_year: Earliest year the indicator must cover (timeLine_min <= min_year).
-        max_year: Latest year the indicator must cover (timeLine_max >= max_year).
-        updated_since: ISO date string (e.g. "2024-01-01"). Only indicators updated on or after this date.
 
     Returns:
         List of matching indicator dicts, ranked by FTS5 relevance when query_term is used.
     """
-    conditions: list[str] = []
-    params: list[str | int] = []
+    conditions, params = _build_indicator_conditions(
+        theme=theme,
+        disaggregation_types=disaggregation_types,
+        disaggregation_values=disaggregation_values,
+    )
     joins: list[str] = []
     order_by = ""
 
@@ -288,49 +336,45 @@ def search_indicators(
         params.append(query_term)
         order_by = "ORDER BY fts.rank"
 
-    if theme is not None:
-        conditions.append("i.theme = ?")
-        params.append(theme)
-
-    if min_year is not None:
-        conditions.append("i.timeLine_min <= ?")
-        params.append(min_year)
-
-    if max_year is not None:
-        conditions.append("i.timeLine_max >= ?")
-        params.append(max_year)
-
-    if updated_since is not None:
-        conditions.append("i.lastDataUpdate >= ?")
-        params.append(updated_since)
-
-    # Each type gets its own EXISTS subquery — indicator must have at least one value per type
-    if disaggregation_types:
-        for type_code in disaggregation_types:
-            conditions.append("""EXISTS (
-                SELECT 1 FROM indicator_disaggregations id_dt
-                JOIN disaggregation_values dv_dt ON dv_dt.id = id_dt.disaggregation_id
-                JOIN disaggregation_types dt ON dt.id = dv_dt.type_id
-                WHERE id_dt.indicator_code = i.code AND dt.type_code = ?
-            )""")
-            params.append(type_code)
-
-    # Values filter: indicator must have ALL listed value codes
-    # Join through type_id to avoid ambiguity when different types share a value code
-    if disaggregation_values:
-        placeholders = ", ".join("?" for _ in disaggregation_values)
-        conditions.append(f"""(
-            SELECT COUNT(DISTINCT dv.id)
-            FROM indicator_disaggregations id_dv
-            JOIN disaggregation_values dv ON dv.id = id_dv.disaggregation_id
-            WHERE id_dv.indicator_code = i.code AND dv.code IN ({placeholders})
-        ) = {len(disaggregation_values)}""")
-        params.extend(disaggregation_values)
-
     join_clause = " ".join(joins)
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    sql = f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max, i.totalRecordCount FROM indicators i {join_clause} {where} {order_by}"
+    sql = f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max FROM indicators i {join_clause} {where} {order_by}"
     return query(sql, tuple(params))
+
+
+def count_indicators(
+    theme: str | None = None,
+    disaggregation_types: list[str] | None = None,
+    disaggregation_values: list[str] | None = None,
+    coverage_start_year: int | None = None,
+    coverage_end_year: int | None = None,
+    updated_since: str | None = None,
+) -> int:
+    """Count indicators matching the given filters.
+
+    Args:
+        theme: Exact match on theme code.
+        disaggregation_types: Indicators must support ALL listed disaggregation type codes.
+        disaggregation_values: Indicators must have ALL listed specific value codes.
+        coverage_start_year: Indicator data must start by this year (timeLine_min <= year).
+        coverage_end_year: Indicator data must extend through this year (timeLine_max >= year).
+        updated_since: ISO date string. Only indicators updated on or after this date.
+
+    Returns:
+        Count of matching indicators.
+    """
+    conditions, params = _build_indicator_conditions(
+        theme=theme,
+        disaggregation_types=disaggregation_types,
+        disaggregation_values=disaggregation_values,
+        coverage_start_year=coverage_start_year,
+        coverage_end_year=coverage_end_year,
+        updated_since=updated_since,
+    )
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    sql = f"SELECT COUNT(*) as cnt FROM indicators i {where}"
+    rows = query(sql, tuple(params))
+    return rows[0]["cnt"] if rows else 0
 
 
 # ── Build ──────────────────────────────────────────────────────────────────

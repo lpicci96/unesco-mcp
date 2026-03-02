@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastmcp import FastMCP
 import unesco_reader as uis
 
-from unesco_mcp.indicator_db import build_db, teardown_db, query as db_query, search_indicators as db_search_indicators, MAX_RESULTS, MAX_RESULTS_CAP
+from unesco_mcp.indicator_db import build_db, teardown_db, query as db_query, search_indicators as db_search_indicators, count_indicators as db_count_indicators, MAX_RESULTS, MAX_RESULTS_CAP
 
 
 @asynccontextmanager
@@ -43,10 +43,19 @@ mcp = FastMCP(
    Only use the query parameter as a secondary refinement for indicator name matching, never as
    the primary filter for concepts that map to disaggregation types or values.
 
+4. USE count_indicators FOR COUNTING: If the user asks how many indicators exist for a given
+   combination of criteria (especially with year range or date filters), use count_indicators.
+   It accepts coverage_start_year, coverage_end_year, and updated_since — filters not available
+   in search_indicators. search_indicators is for discovery; count_indicators is for counting.
+
 Example: "Show me primary education completion indicators by sex"
   → list_disaggregation_types → find "education level" type code (e.g. "EDU_LEVEL") and "sex" type code (e.g. "SEX")
   → get_disaggregation_values("EDU_LEVEL") → find "primary education" value code (e.g. "L1")
   → search_indicators(disaggregation_types=["EDU_LEVEL", "SEX"], disaggregation_values=["L1"], query="completion")
+
+Example: "How many education indicators have data from 2010 to 2020?"
+  → list_themes → find education theme code
+  → count_indicators(theme="EDUCATION", coverage_start_year=2010, coverage_end_year=2020)
 """,
 )
 
@@ -174,53 +183,43 @@ async def search_indicators(
     theme: str | None = None,
     disaggregation_types: list[str] | None = None,
     disaggregation_values: list[str] | None = None,
-    min_year: int | None = None,
-    max_year: int | None = None,
-    updated_since: str | None = None,
     limit: int = MAX_RESULTS,
 ) -> dict:
-    """Search UNESCO UIS indicators using structured filters and optional text matching.
+    """Search UNESCO UIS indicators by relevance using text and structured filters.
+
+    Use this tool to discover which indicators exist for a topic. For counting indicators
+    with precise year or date filters, use count_indicators instead.
 
     IMPORTANT - SUGGESTED WORKFLOW:
     1. Call list_themes if the user mentions a thematic area (e.g. "education", "culture") to find the exact theme code.
-    2. Call list_disaggregation_types to find relevant disaggregation type codes for user concepts like "sex", and
-        "education level". Then call get_disaggregation_values for each type to find the exact value codes for concepts like "female"
-        or "primary education". DO NOT pass concepts like "primary education" or "female" as the query parameter —
-        these are disaggregation values and should be looked up and passed as disaggregation_values for accurate
-        results.
-    3. Pass the discovered theme code, disaggregation type codes, and disaggregation value codes as structured filters
-     to this search_indicators tool.
-    4. Use the additional filters for other refinement (e.g. if the user also mentioned a year range)
-    5. Only use the query parameter for additional name-based narrowing AFTER applying structured filters,
-      or when the user's request genuinely has no matching disaggregation type or theme.
+    2. Call list_disaggregation_types to find relevant disaggregation type codes for user concepts like "sex" or
+       "education level". Then call get_disaggregation_values for each type to find exact value codes for concepts
+       like "female" or "primary education". DO NOT pass these as the query parameter — they are disaggregation
+       values and must be looked up for accurate results.
+    3. Pass discovered codes as structured filters. Only use query for additional name-based narrowing AFTER
+       applying structured filters, or when the user's request has no matching disaggregation type or theme.
 
-    The total results found are not absolute. There may be some results that don't fully match the user's
-    search, or some indicators that didn't make it into the results. Always report the findings back to the user
-    accurately and transparently, and suggest next steps for refining the search if needed.
-
-
-    All provided filters are combined with AND logic. At least one filter parameter must be provided.
-    Results default to 20. If more exist, tell the user the total count and suggest
-    narrowing with additional filters rather than increasing the limit.
+    All provided filters are combined with AND logic. At least one filter must be provided.
+    Results default to 20. If more exist, suggest narrowing with additional filters rather than increasing the limit.
 
     Args:
-        query: Full-text search on indicator name (supports stemming, e.g. "completing" matches "completion"). Secondary refinement only — do not use for concepts that map to themes or disaggregations.
+        query: Full-text search on indicator name (supports stemming, e.g. "completing" matches "completion").
+               Secondary refinement only — do not use for concepts that map to themes or disaggregations.
         theme: Exact theme code (from list_themes).
         disaggregation_types: List of disaggregation type codes (from list_disaggregation_types). Indicators must support ALL listed types.
         disaggregation_values: List of disaggregation value codes (from get_disaggregation_values). Indicators must match ALL listed values.
-        min_year: Earliest year needed. Only returns indicators whose time coverage starts at or before this year.
-        max_year: Latest year needed. Only returns indicators whose time coverage extends to or beyond this year.
-        updated_since: ISO date (e.g. "2024-01-01"). Only returns indicators updated on or after this date.
         limit: Maximum number of results to return (default 20, max 50). Prefer narrowing filters over increasing limit.
 
     Returns:
         A dictionary with:
-            - "indicators": List of matching indicators (code, name, theme, timeLine_min, timeLine_max, totalRecordCount).
-            - "total found": Total number of potentially matching indicators.
-            - "total returned": Number of indicators returned.
+            - "indicators": List of matching indicators, each with: code, name, theme, timeLine_min, timeLine_max.
+            - "query_matches": Number of indicators matched by this query. This is NOT the total count of all
+              UNESCO indicators — it only reflects how many matched these specific filters. Some relevant
+              indicators may be missing if the query is too narrow or the text search didn't capture them.
+            - "returned": Number of indicators included in this response (may be less than query_matches if truncated).
             - "hint": Guidance on next steps.
     """
-    if not any([query, theme, disaggregation_types, disaggregation_values, min_year, max_year, updated_since]):
+    if not any([query, theme, disaggregation_types, disaggregation_values]):
         return {"error": "At least one filter parameter must be provided."}
 
     effective_limit = min(max(limit, 1), MAX_RESULTS_CAP)
@@ -230,9 +229,6 @@ async def search_indicators(
         theme=theme,
         disaggregation_types=disaggregation_types,
         disaggregation_values=disaggregation_values,
-        min_year=min_year,
-        max_year=max_year,
-        updated_since=updated_since,
     )
 
     total = len(all_results)
@@ -242,18 +238,153 @@ async def search_indicators(
     hint = "Use indicator codes to retrieve data."
     if truncated:
         hint += (
-            f" Showing {effective_limit} of {total} total matches."
+            f" Showing {effective_limit} of {total} query matches."
             " Tell the user how many were found and suggest narrowing with additional filters"
-            " (theme, disaggregation_types, disaggregation_values, query, min_year, max_year, updated_since)"
+            " (theme, disaggregation_types, disaggregation_values, query)"
             " rather than increasing the limit."
         )
 
     return {
         "indicators": results,
-        "total found": total,
-        "total returned": len(results),
+        "query_matches": total,
+        "returned": len(results),
         "hint": hint,
     }
+
+
+@mcp.tool()
+async def count_indicators(
+    theme: str | None = None,
+    disaggregation_types: list[str] | None = None,
+    disaggregation_values: list[str] | None = None,
+    coverage_start_year: int | None = None,
+    coverage_end_year: int | None = None,
+    updated_since: str | None = None,
+) -> dict:
+    """Count UNESCO UIS indicators matching precise filter criteria.
+
+    Use this tool when the user wants to know how many indicators exist for a given
+    combination of filters, including year coverage or update date constraints.
+    Unlike search_indicators, this tool returns an exact count and accepts year range filters.
+
+    All provided filters are combined with AND logic. If no filters are provided, returns
+    the total count of all indicators in the database.
+
+    Args:
+        theme: Exact theme code (from list_themes).
+        disaggregation_types: List of disaggregation type codes. Indicators must support ALL listed types.
+        disaggregation_values: List of disaggregation value codes. Indicators must match ALL listed values.
+        coverage_start_year: Only count indicators whose data begins by this year (i.e. timeLine_min <= year).
+        coverage_end_year: Only count indicators whose data extends through this year (i.e. timeLine_max >= year).
+        updated_since: ISO date string (e.g. "2024-01-01"). Only count indicators updated on or after this date.
+
+    Returns:
+        A dictionary with:
+            - "count": The exact number of indicators matching all provided filters.
+            - "filters_applied": A summary of which filters were used.
+    """
+    count = db_count_indicators(
+        theme=theme,
+        disaggregation_types=disaggregation_types,
+        disaggregation_values=disaggregation_values,
+        coverage_start_year=coverage_start_year,
+        coverage_end_year=coverage_end_year,
+        updated_since=updated_since,
+    )
+
+    filters_applied = {k: v for k, v in {
+        "theme": theme,
+        "disaggregation_types": disaggregation_types,
+        "disaggregation_values": disaggregation_values,
+        "coverage_start_year": coverage_start_year,
+        "coverage_end_year": coverage_end_year,
+        "updated_since": updated_since,
+    }.items() if v is not None}
+
+    return {
+        "count": count,
+        "filters_applied": filters_applied or "none (total across all indicators)",
+    }
+
+
+@mcp.tool()
+async def get_indicator_metadata(indicator_code: str) -> dict:
+    """Get detailed metadata for a specific UNESCO UIS indicator.
+
+    Returns definitional and methodological information for an indicator, including
+    its glossary definition, purpose, calculation method, data sources, and available
+    disaggregations. Use this after finding indicator codes via search_indicators.
+
+    Args:
+        indicator_code: The indicator code (e.g. "CR.1", "ROFST.1.cp").
+
+    Returns:
+        A dictionary with:
+            - "code": Indicator code.
+            - "name": Full indicator name.
+            - "theme": Theme code.
+            - "last_update": Date and description of the most recent data release.
+            - "data_availability": Time coverage (min/max year), total record count, and geographic unit types.
+            - "definition": Glossary entry with definition, purpose, calculation method, data source,
+              interpretation, and limitations (if available).
+            - "disaggregations": List of available disaggregation breakdowns (code, name, type).
+    """
+    results = uis.get_metadata(indicator_code, glossaryTerms=True, disaggregations=True)
+
+    if not results:
+        return {"error": f"No metadata found for indicator '{indicator_code}'."}
+
+    raw = results[0]
+
+    # Core identity
+    out: dict = {
+        "code": raw.get("indicatorCode"),
+        "name": raw.get("name"),
+        "theme": raw.get("theme"),
+        "last_update": {
+            "date": raw.get("lastDataUpdate"),
+            "description": raw.get("lastDataUpdateDescription"),
+        },
+    }
+
+    # Data availability
+    avail = raw.get("dataAvailability", {})
+    timeline = avail.get("timeLine", {})
+    geo = avail.get("geoUnits", {})
+    out["data_availability"] = {
+        "year_min": timeline.get("min"),
+        "year_max": timeline.get("max"),
+        "total_records": avail.get("totalRecordCount"),
+        "geo_unit_types": geo.get("types", []),
+    }
+
+    # Glossary — take the first term's key fields
+    glossary_terms = raw.get("glossaryTerms", [])
+    if glossary_terms:
+        term = glossary_terms[0]
+        out["definition"] = {k: v for k, v in {
+            "name": term.get("name"),
+            "definition": term.get("definition"),
+            "purpose": term.get("purpose"),
+            "calculation_method": term.get("calculationMethod"),
+            "data_source": term.get("dataSource"),
+            "interpretation": term.get("interpretation"),
+            "limitations": term.get("limitations"),
+        }.items() if v}
+
+    # Disaggregations — code, name, type only (skip nested glossary terms)
+    disaggregations = raw.get("disaggregations", [])
+    out["disaggregations"] = [
+        {
+            "code": d.get("code"),
+            "name": d.get("name"),
+            "type_code": d.get("disaggregationType", {}).get("code"),
+            "type_name": d.get("disaggregationType", {}).get("name"),
+        }
+        for d in disaggregations
+    ]
+
+    return out
 
 
 def main() -> None:

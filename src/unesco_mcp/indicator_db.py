@@ -1,6 +1,8 @@
 """SQLite database for caching UNESCO UIS indicators and disaggregation metadata."""
 
+import csv
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import unesco_reader as uis
 DB_PATH = Path(__file__).parent / "uis.db"
 MAX_RESULTS = 20
 MAX_RESULTS_CAP = 50
+MAX_SUMMARY_CODES = 10
 
 
 @contextmanager
@@ -83,6 +86,20 @@ def _indicator_disaggregations_table():
            '''
 
 
+def _themes_table():
+    """Return CREATE TABLE statement for the themes table."""
+
+    return """
+           CREATE TABLE IF NOT EXISTS themes
+           (code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            last_update TEXT,
+            last_update_description TEXT,
+            indicator_count INTEGER
+           )
+           """
+
+
 def _fts_table():
     """Return CREATE VIRTUAL TABLE statement for FTS5 full-text search on indicator names."""
 
@@ -113,6 +130,7 @@ def init_db():
         cursor = conn.cursor()
 
         cursor.execute(_indicators_table())
+        cursor.execute(_themes_table())
         cursor.execute(_fts_table())
         cursor.execute(_disaggregations_type_table())
         cursor.execute(_disaggregations_values_table())
@@ -149,6 +167,54 @@ def store_indicators():
             "INSERT INTO indicators_fts (code, name) VALUES (?, ?)",
             [(code, name) for code, name, *_ in rows],
         )
+
+
+def store_themes():
+    """Fetch theme metadata from the UIS API and store in the themes table.
+
+    Derives human-readable names from theme codes and computes indicator counts
+    from the indicators table (which must be populated first).
+    """
+    themes = uis.available_themes(raw=True)
+
+    rows = []
+    for item in themes:
+        code = item["theme"]
+        parts = code.lower().split("_")
+        if len(parts) == 1:
+            name = parts[0]
+        else:
+            name = ", ".join(parts[:-1]) + " & " + parts[-1]
+        name = name.title()
+
+        # Count indicators for this theme from the already-populated indicators table
+        count_rows = query(
+            "SELECT COUNT(*) as cnt FROM indicators WHERE theme = ?", (code,)
+        )
+        indicator_count = count_rows[0]["cnt"] if count_rows else 0
+
+        rows.append((
+            code,
+            name,
+            item.get("lastUpdate"),
+            item.get("lastUpdateDescription"),
+            indicator_count,
+        ))
+
+    with _get_connection() as conn:
+        conn.executemany("""
+            INSERT OR REPLACE INTO themes
+            (code, name, last_update, last_update_description, indicator_count)
+            VALUES (?, ?, ?, ?, ?)
+            """, rows)
+
+
+def get_themes() -> list[dict]:
+    """Return all themes from the database."""
+    return query(
+        "SELECT code, name, last_update, last_update_description, indicator_count "
+        "FROM themes ORDER BY name"
+    )
 
 
 def get_disaggregations() -> dict:
@@ -302,7 +368,8 @@ def search_indicators(
     theme: str | None = None,
     disaggregation_types: list[str] | None = None,
     disaggregation_values: list[str] | None = None,
-) -> list[dict]:
+    limit: int | None = None,
+) -> tuple[list[dict], int]:
     """Search indicators with structured filters and optional FTS5 text matching.
 
     Structured filters (theme, disaggregation_types, disaggregation_values) are applied
@@ -318,9 +385,11 @@ def search_indicators(
         theme: Exact match on theme code.
         disaggregation_types: Filter for broad disaggregation types (e.g. ["SEX", "AGE"]).
         disaggregation_values: Filter for specific disaggregation value codes (e.g. ["M", "F"]).
+        limit: Maximum number of results to return. None means no limit.
 
     Returns:
-        List of matching indicator dicts, ranked by FTS5 relevance when query_term is used.
+        Tuple of (results, total_count) where results is a list of matching indicator
+        dicts and total_count is the total number of matches before limiting.
     """
     conditions, params = _build_indicator_conditions(
         theme=theme,
@@ -338,8 +407,71 @@ def search_indicators(
 
     join_clause = " ".join(joins)
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    sql = f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max FROM indicators i {join_clause} {where} {order_by}"
-    return query(sql, tuple(params))
+
+    # Count total matches first
+    count_sql = f"SELECT COUNT(*) as cnt FROM indicators i {join_clause} {where}"
+    count_rows = query(count_sql, tuple(params))
+    total_count = count_rows[0]["cnt"] if count_rows else 0
+
+    # Fetch data with optional LIMIT
+    data_sql = f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max FROM indicators i {join_clause} {where} {order_by}"
+    data_params = list(params)
+    if limit is not None:
+        data_sql += " LIMIT ?"
+        data_params.append(limit)
+
+    results = query(data_sql, tuple(data_params))
+    return results, total_count
+
+
+def get_indicator_summaries(codes: list[str]) -> list[dict]:
+    """Return lightweight summaries for the given indicator codes.
+
+    Fetches base fields from the indicators table and distinct disaggregation
+    type names for each indicator. Much lighter than a full metadata API call.
+
+    Args:
+        codes: List of indicator codes (max MAX_SUMMARY_CODES).
+
+    Returns:
+        List of indicator summary dicts, each with disaggregation_types list.
+    """
+    if not codes:
+        return []
+
+    placeholders = ", ".join("?" for _ in codes)
+    indicators = query(
+        f"SELECT code, name, theme, timeLine_min, timeLine_max, "
+        f"totalRecordCount, geoUnitType, lastDataUpdate "
+        f"FROM indicators WHERE code IN ({placeholders})",
+        tuple(codes),
+    )
+
+    if not indicators:
+        return []
+
+    # Get distinct disaggregation type names per indicator
+    found_codes = [ind["code"] for ind in indicators]
+    found_placeholders = ", ".join("?" for _ in found_codes)
+    disagg_rows = query(
+        f"SELECT id_map.indicator_code, dt.type_name "
+        f"FROM indicator_disaggregations id_map "
+        f"JOIN disaggregation_values dv ON dv.id = id_map.disaggregation_id "
+        f"JOIN disaggregation_types dt ON dt.id = dv.type_id "
+        f"WHERE id_map.indicator_code IN ({found_placeholders}) "
+        f"GROUP BY id_map.indicator_code, dt.type_name",
+        tuple(found_codes),
+    )
+
+    # Group disaggregation type names by indicator code
+    disagg_by_code: dict[str, list[str]] = {}
+    for row in disagg_rows:
+        disagg_by_code.setdefault(row["indicator_code"], []).append(row["type_name"])
+
+    for ind in indicators:
+        ind["disaggregation_types"] = disagg_by_code.get(ind["code"], [])
+
+    return indicators
 
 
 def count_indicators(
@@ -377,6 +509,79 @@ def count_indicators(
     return rows[0]["cnt"] if rows else 0
 
 
+def export_indicators_to_csv(
+    query_term: str | None = None,
+    theme: str | None = None,
+    disaggregation_types: list[str] | None = None,
+    disaggregation_values: list[str] | None = None,
+) -> tuple[str, int]:
+    """Export matching indicators to a CSV file.
+
+    Uses the same filter logic as search_indicators but exports all matches
+    (no limit) along with disaggregation type names.
+
+    Returns:
+        Tuple of (file_path, row_count).
+    """
+    conditions, params = _build_indicator_conditions(
+        theme=theme,
+        disaggregation_types=disaggregation_types,
+        disaggregation_values=disaggregation_values,
+    )
+    joins: list[str] = []
+
+    if query_term is not None:
+        joins.append("JOIN indicators_fts fts ON fts.code = i.code")
+        conditions.append("indicators_fts MATCH ?")
+        params.append(query_term)
+
+    join_clause = " ".join(joins)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    indicators = query(
+        f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max, "
+        f"i.totalRecordCount, i.lastDataUpdate "
+        f"FROM indicators i {join_clause} {where}",
+        tuple(params),
+    )
+
+    # Get disaggregation type names for matched indicators
+    disagg_by_code: dict[str, list[str]] = {}
+    if indicators:
+        codes = [ind["code"] for ind in indicators]
+        placeholders = ", ".join("?" for _ in codes)
+        disagg_rows = query(
+            f"SELECT id_map.indicator_code, dt.type_name "
+            f"FROM indicator_disaggregations id_map "
+            f"JOIN disaggregation_values dv ON dv.id = id_map.disaggregation_id "
+            f"JOIN disaggregation_types dt ON dt.id = dv.type_id "
+            f"WHERE id_map.indicator_code IN ({placeholders}) "
+            f"GROUP BY id_map.indicator_code, dt.type_name",
+            tuple(codes),
+        )
+        for row in disagg_rows:
+            disagg_by_code.setdefault(row["indicator_code"], []).append(row["type_name"])
+
+    # Write CSV
+    export_dir = tempfile.mkdtemp(prefix="unesco_mcp_export_")
+    file_path = Path(export_dir) / "indicators.csv"
+    fieldnames = [
+        "code", "name", "theme", "timeLine_min", "timeLine_max",
+        "totalRecordCount", "lastDataUpdate", "disaggregation_types",
+    ]
+
+    with open(file_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for ind in indicators:
+            ind["disaggregation_types"] = "; ".join(
+                disagg_by_code.get(ind["code"], [])
+            )
+            writer.writerow(ind)
+
+    return str(file_path), len(indicators)
+
+
 # ── Build ──────────────────────────────────────────────────────────────────
 
 
@@ -391,6 +596,7 @@ def build_db(fresh: bool = False):
         teardown_db()
     init_db()
     store_indicators()
+    store_themes()
 
     disaggregations = get_disaggregations()
     store_disaggregation_types(disaggregations)

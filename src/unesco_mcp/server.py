@@ -5,7 +5,19 @@ from datetime import datetime, timezone
 from fastmcp import FastMCP
 import unesco_reader as uis
 
-from unesco_mcp.indicator_db import build_db, teardown_db, query as db_query, search_indicators as db_search_indicators, count_indicators as db_count_indicators, MAX_RESULTS, MAX_RESULTS_CAP
+from unesco_mcp.indicator_db import (
+    build_db,
+    teardown_db,
+    query as db_query,
+    search_indicators as db_search_indicators,
+    count_indicators as db_count_indicators,
+    get_themes as db_get_themes,
+    get_indicator_summaries as db_get_indicator_summaries,
+    export_indicators_to_csv as db_export_indicators_to_csv,
+    MAX_RESULTS,
+    MAX_RESULTS_CAP,
+    MAX_SUMMARY_CODES,
+)
 
 
 @asynccontextmanager
@@ -53,6 +65,17 @@ Example: "Show me primary education completion indicators by sex"
   → get_disaggregation_values("EDU_LEVEL") → find "primary education" value code (e.g. "L1")
   → search_indicators(disaggregation_types=["EDU_LEVEL", "SEX"], disaggregation_values=["L1"], query="completion")
 
+5. USE get_indicator_summary FOR QUICK OVERVIEWS: When the user needs a quick comparison
+   of several indicators (e.g. after a search), use get_indicator_summary with their codes.
+   It returns key fields and disaggregation type names from the local database — much faster
+   than get_indicator_metadata. Reserve get_indicator_metadata for when the user needs full
+   definitions, methodology, or detailed disaggregation breakdowns for a single indicator.
+
+6. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
+   or get a full/complete list of indicators, use export_indicators — NOT search_indicators.
+   Trigger words include: "save", "download", "export", "give me all", "full list", "complete
+   list". export_indicators has no result cap and writes a CSV file the user can access.
+
 Example: "How many education indicators have data from 2010 to 2020?"
   → list_themes → find education theme code
   → count_indicators(theme="EDUCATION", coverage_start_year=2010, coverage_end_year=2020)
@@ -84,21 +107,7 @@ async def list_themes() -> dict:
             - "hint": A string providing guidance on how to use the theme codes for searching indicators
     """
 
-    themes = uis.available_themes(raw=True)
-    indicators = uis.available_indicators()
-
-    for item in themes:
-        parts = item["theme"].lower().split("_")
-
-        if len(parts) == 1:
-            name = parts[0]
-        else:
-            name = ", ".join(parts[:-1]) + " & " + parts[-1]
-
-        item["name"] = name.title()
-        item["code"] = item.pop("theme")  # rename key
-
-        item["indicator_count"] = len(indicators.loc[lambda d: d.theme == item["code"]])
+    themes = db_get_themes()
 
     return {
         "theme information": themes,
@@ -187,8 +196,11 @@ async def search_indicators(
 ) -> dict:
     """Search UNESCO UIS indicators by relevance using text and structured filters.
 
-    Use this tool to discover which indicators exist for a topic. For counting indicators
-    with precise year or date filters, use count_indicators instead.
+    Use this tool to discover which indicators exist for a topic. Results are capped
+    (default 20, max 50) and intended for interactive exploration only — do NOT use
+    this to save, download, or give the user a full list of indicators. For that,
+    use export_indicators instead. For counting indicators with precise year or date
+    filters, use count_indicators.
 
     IMPORTANT - SUGGESTED WORKFLOW:
     1. Call list_themes if the user mentions a thematic area (e.g. "education", "culture") to find the exact theme code.
@@ -224,16 +236,15 @@ async def search_indicators(
 
     effective_limit = min(max(limit, 1), MAX_RESULTS_CAP)
 
-    all_results = db_search_indicators(
+    results, total = db_search_indicators(
         query_term=query,
         theme=theme,
         disaggregation_types=disaggregation_types,
         disaggregation_values=disaggregation_values,
+        limit=effective_limit,
     )
 
-    total = len(all_results)
     truncated = total > effective_limit
-    results = all_results[:effective_limit]
 
     hint = "Use indicator codes to retrieve data."
     if truncated:
@@ -385,6 +396,90 @@ async def get_indicator_metadata(indicator_code: str) -> dict:
     ]
 
     return out
+
+
+@mcp.tool()
+async def get_indicator_summary(indicator_codes: list[str]) -> dict:
+    """Get a lightweight summary for one or more UNESCO UIS indicators.
+
+    Returns key fields from the local database without making API calls.
+    Much faster than get_indicator_metadata — use this when you need a quick
+    overview of multiple indicators (e.g. after a search) rather than full
+    definitional detail.
+
+    Use get_indicator_metadata when you need glossary definitions, methodology,
+    or detailed disaggregation breakdowns for a single indicator.
+
+    Args:
+        indicator_codes: List of indicator codes (1–10). Use codes from search_indicators results.
+
+    Returns:
+        A dictionary with:
+            - "indicators": List of summaries, each with code, name, theme, timeLine_min/max,
+              totalRecordCount, geoUnitType, lastDataUpdate, and disaggregation_types (list of type names).
+            - "returned": Number of indicators found.
+            - "not_found": List of requested codes that were not in the database.
+    """
+    if not indicator_codes:
+        return {"error": "At least one indicator code must be provided."}
+
+    if len(indicator_codes) > MAX_SUMMARY_CODES:
+        return {"error": f"Maximum {MAX_SUMMARY_CODES} indicator codes allowed per request."}
+
+    summaries = db_get_indicator_summaries(indicator_codes)
+    found_codes = {s["code"] for s in summaries}
+    not_found = [c for c in indicator_codes if c not in found_codes]
+
+    return {
+        "indicators": summaries,
+        "returned": len(summaries),
+        "not_found": not_found,
+    }
+
+
+@mcp.tool()
+async def export_indicators(
+    query: str | None = None,
+    theme: str | None = None,
+    disaggregation_types: list[str] | None = None,
+    disaggregation_values: list[str] | None = None,
+) -> dict:
+    """Export matching UNESCO UIS indicators to a CSV file.
+
+    Use this tool whenever the user wants to save, download, export, or get a full
+    list of indicators — even if they just say "give me all education indicators" or
+    "save the results". Unlike search_indicators (which caps results at 50), this
+    writes every match to a CSV file with no limit and returns the file path.
+
+    At least one filter must be provided.
+
+    Args:
+        query: Full-text search on indicator name (FTS5 with stemming).
+        theme: Exact theme code (from list_themes).
+        disaggregation_types: List of disaggregation type codes. Indicators must support ALL listed types.
+        disaggregation_values: List of disaggregation value codes. Indicators must match ALL listed values.
+
+    Returns:
+        A dictionary with:
+            - "file_path": Absolute path to the generated CSV file.
+            - "row_count": Number of indicators exported.
+            - "hint": Guidance for the user.
+    """
+    if not any([query, theme, disaggregation_types, disaggregation_values]):
+        return {"error": "At least one filter parameter must be provided."}
+
+    file_path, row_count = db_export_indicators_to_csv(
+        query_term=query,
+        theme=theme,
+        disaggregation_types=disaggregation_types,
+        disaggregation_values=disaggregation_values,
+    )
+
+    return {
+        "file_path": file_path,
+        "row_count": row_count,
+        "hint": "CSV file created. Share the file path with the user so they can access it.",
+    }
 
 
 def main() -> None:

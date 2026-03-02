@@ -13,7 +13,10 @@ from unesco_mcp.indicator_db import (
     count_indicators as db_count_indicators,
     get_themes as db_get_themes,
     get_indicator_summaries as db_get_indicator_summaries,
-    export_indicators_to_csv as db_export_indicators_to_csv,
+    get_export_rows as db_get_export_rows,
+    rows_to_csv_string,
+    write_export_csv,
+    EXPORT_INLINE_LIMIT,
     MAX_RESULTS,
     MAX_RESULTS_CAP,
     MAX_SUMMARY_CODES,
@@ -444,12 +447,16 @@ async def export_indicators(
     disaggregation_types: list[str] | None = None,
     disaggregation_values: list[str] | None = None,
 ) -> dict:
-    """Export matching UNESCO UIS indicators to a CSV file.
+    """Export matching UNESCO UIS indicators to CSV.
 
     Use this tool whenever the user wants to save, download, export, or get a full
     list of indicators — even if they just say "give me all education indicators" or
     "save the results". Unlike search_indicators (which caps results at 50), this
-    writes every match to a CSV file with no limit and returns the file path.
+    fetches every match with no limit.
+
+    Small results (≤ 100 rows) are returned inline as CSV text so you can display
+    them directly in chat. Larger results are written to ~/Downloads/ and you must
+    tell the user the exact file path.
 
     At least one filter must be provided.
 
@@ -460,25 +467,37 @@ async def export_indicators(
         disaggregation_values: List of disaggregation value codes. Indicators must match ALL listed values.
 
     Returns:
-        A dictionary with:
-            - "file_path": Absolute path to the generated CSV file.
-            - "row_count": Number of indicators exported.
-            - "hint": Guidance for the user.
+        One of two shapes:
+        - Inline (≤ 100 rows): {"csv": "<csv text>", "row_count": N, "delivery": "inline"}
+        - File  (> 100 rows):  {"file_path": "/path/to/file.csv", "row_count": N, "delivery": "file",
+                                 "preview": "<first 5 rows as csv>"}
+          When delivery is "file", tell the user: "Your indicators have been saved to: <file_path>"
     """
     if not any([query, theme, disaggregation_types, disaggregation_values]):
         return {"error": "At least one filter parameter must be provided."}
 
-    file_path, row_count = db_export_indicators_to_csv(
+    rows = db_get_export_rows(
         query_term=query,
         theme=theme,
         disaggregation_types=disaggregation_types,
         disaggregation_values=disaggregation_values,
     )
+    row_count = len(rows)
 
+    if row_count <= EXPORT_INLINE_LIMIT:
+        return {
+            "csv": rows_to_csv_string(rows),
+            "row_count": row_count,
+            "delivery": "inline",
+        }
+
+    file_path = write_export_csv(rows)
     return {
         "file_path": file_path,
         "row_count": row_count,
-        "hint": "CSV file created. Share the file path with the user so they can access it.",
+        "delivery": "file",
+        "preview": rows_to_csv_string(rows[:5]),
+        "instruction": f"Tell the user: 'Your {row_count} indicators have been saved to: {file_path}'",
     }
 
 

@@ -1,9 +1,10 @@
 """SQLite database for caching UNESCO UIS indicators and disaggregation metadata."""
 
 import csv
+import io
 import sqlite3
-import tempfile
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 import unesco_reader as uis
@@ -509,19 +510,23 @@ def count_indicators(
     return rows[0]["cnt"] if rows else 0
 
 
-def export_indicators_to_csv(
+EXPORT_FIELDNAMES = [
+    "code", "name", "theme", "timeLine_min", "timeLine_max",
+    "totalRecordCount", "lastDataUpdate", "disaggregation_types",
+]
+EXPORT_INLINE_LIMIT = 100
+
+
+def get_export_rows(
     query_term: str | None = None,
     theme: str | None = None,
     disaggregation_types: list[str] | None = None,
     disaggregation_values: list[str] | None = None,
-) -> tuple[str, int]:
-    """Export matching indicators to a CSV file.
+) -> list[dict]:
+    """Fetch all matching indicators with disaggregation_types merged in.
 
-    Uses the same filter logic as search_indicators but exports all matches
-    (no limit) along with disaggregation type names.
-
-    Returns:
-        Tuple of (file_path, row_count).
+    Uses the same filter logic as search_indicators but with no result limit.
+    Each row has disaggregation_types as a semicolon-separated string.
     """
     conditions, params = _build_indicator_conditions(
         theme=theme,
@@ -545,41 +550,59 @@ def export_indicators_to_csv(
         tuple(params),
     )
 
-    # Get disaggregation type names for matched indicators
-    disagg_by_code: dict[str, list[str]] = {}
-    if indicators:
-        codes = [ind["code"] for ind in indicators]
-        placeholders = ", ".join("?" for _ in codes)
-        disagg_rows = query(
-            f"SELECT id_map.indicator_code, dt.type_name "
-            f"FROM indicator_disaggregations id_map "
-            f"JOIN disaggregation_values dv ON dv.id = id_map.disaggregation_id "
-            f"JOIN disaggregation_types dt ON dt.id = dv.type_id "
-            f"WHERE id_map.indicator_code IN ({placeholders}) "
-            f"GROUP BY id_map.indicator_code, dt.type_name",
-            tuple(codes),
-        )
-        for row in disagg_rows:
-            disagg_by_code.setdefault(row["indicator_code"], []).append(row["type_name"])
+    if not indicators:
+        return []
 
-    # Write CSV
-    export_dir = tempfile.mkdtemp(prefix="unesco_mcp_export_")
-    file_path = Path(export_dir) / "indicators.csv"
-    fieldnames = [
-        "code", "name", "theme", "timeLine_min", "timeLine_max",
-        "totalRecordCount", "lastDataUpdate", "disaggregation_types",
-    ]
+    # Attach disaggregation type names
+    codes = [ind["code"] for ind in indicators]
+    placeholders = ", ".join("?" for _ in codes)
+    disagg_rows = query(
+        f"SELECT id_map.indicator_code, dt.type_name "
+        f"FROM indicator_disaggregations id_map "
+        f"JOIN disaggregation_values dv ON dv.id = id_map.disaggregation_id "
+        f"JOIN disaggregation_types dt ON dt.id = dv.type_id "
+        f"WHERE id_map.indicator_code IN ({placeholders}) "
+        f"GROUP BY id_map.indicator_code, dt.type_name",
+        tuple(codes),
+    )
+    disagg_by_code: dict[str, list[str]] = {}
+    for row in disagg_rows:
+        disagg_by_code.setdefault(row["indicator_code"], []).append(row["type_name"])
+
+    for ind in indicators:
+        ind["disaggregation_types"] = "; ".join(disagg_by_code.get(ind["code"], []))
+
+    return indicators
+
+
+def rows_to_csv_string(rows: list[dict]) -> str:
+    """Serialise export rows to a CSV string."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=EXPORT_FIELDNAMES)
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def write_export_csv(rows: list[dict], label: str = "indicators") -> str:
+    """Write export rows to ~/Downloads (falling back to home dir).
+
+    Uses a timestamped filename so repeated exports don't overwrite each other.
+    Returns the absolute file path.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"unesco_{label}_{timestamp}.csv"
+
+    downloads = Path.home() / "Downloads"
+    out_dir = downloads if downloads.is_dir() else Path.home()
+    file_path = out_dir / filename
 
     with open(file_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDNAMES)
         writer.writeheader()
-        for ind in indicators:
-            ind["disaggregation_types"] = "; ".join(
-                disagg_by_code.get(ind["code"], [])
-            )
-            writer.writerow(ind)
+        writer.writerows(rows)
 
-    return str(file_path), len(indicators)
+    return str(file_path)
 
 
 # ── Build ──────────────────────────────────────────────────────────────────

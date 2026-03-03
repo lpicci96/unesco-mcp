@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastmcp import FastMCP, Context
 import unesco_reader as uis
-from unesco_reader.exceptions import NoDataError
+from unesco_reader.exceptions import NoDataError, TooManyRecordsError
 
 from unesco_mcp.indicator_db import (
     build_db,
@@ -74,17 +74,28 @@ Example: "Show me primary education completion indicators by sex"
    than get_indicator_metadata. Reserve get_indicator_metadata for when the user needs full
    definitions, methodology, or detailed disaggregation breakdowns for a single indicator.
 
-6. GEOGRAPHY RESOLUTION FOR get_latest_value — single clear rule:
+6. GEOGRAPHY RESOLUTION — single clear rule for get_latest_value AND get_time_series:
    - OMIT geo_unit_code (do not pass it) in ALL cases EXCEPT when you already hold an
      exact, previously-confirmed code from a prior elicitation or from a user who typed
-     a raw ISO3 code (e.g. "KEN", "ZWE"). When geo_unit_code is omitted, get_latest_value
-     will elicit the geography, name, and grouping (if ambiguous) directly from the user.
+     a raw ISO3 code (e.g. "KEN", "ZWE"). When geo_unit_code is omitted, the tool will
+     elicit the geography, name, and grouping (if ambiguous) directly from the user.
    - NEVER guess or construct a geo unit code yourself (e.g. "SDG: Sub-Saharan Africa").
      Even if the user names a country or region, omit the code so the elicitation chain
      runs. The tool will search and disambiguate automatically.
    - Use search_geo_units ONLY for pure geography discovery (e.g. "what regions are
      available?", "show me countries in Africa") — never as a mandatory pre-step before
-     get_latest_value.
+     get_latest_value or get_time_series.
+
+7. DATA RETRIEVAL — choose the right tool:
+   - Single data point (latest or specific year) → get_latest_value
+   - Trend over time / full time series → get_time_series
+     (same geo elicitation pattern as get_latest_value; accepts start_year / end_year)
+   - Best/worst countries globally → get_country_ranking
+     (no geography argument needed; returns top-N and bottom-N countries only, not regions)
+   - Compare a specific set of countries or regions → compare_geographies
+     (pass pre-confirmed geo_unit_codes; supports up to 20 codes; ranks by value)
+   - Check data coverage before ranking or comparing → get_data_availability
+     (shows which geographies and years have data; use to verify indicator coverage)
 
 8. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
    or get a full/complete list of indicators, use export_indicators — NOT search_indicators.
@@ -629,7 +640,459 @@ async def search_geo_units(
         "hint": hint,
     }
 
-#TODO: data tools - country ranking, visualise trend, country comparison, data export
+def _rows_to_ranking(subset) -> list[dict]:
+    """Format a ranked DataFrame slice into a list of dicts."""
+    out = []
+    for _, row in subset.iterrows():
+        out.append({
+            "rank": int(row["rank"]),
+            "code": str(row["geoUnit"]),
+            "name": str(row["geoUnitName"]),
+            "value": round(float(row["value"]), 6),
+        })
+    return out
+
+
+def _safe_qualifier(row) -> str | None:
+    """Return the qualifier string, or None if absent / NaN."""
+    q = row.get("qualifier")
+    if q and str(q) != "nan":
+        return str(q)
+    return None
+
+
+@mcp.tool()
+async def get_time_series(
+    ctx: Context,
+    indicator_code: str,
+    geo_unit_code: str | None = None,
+    start_year: int | None = None,
+    end_year: int | None = None,
+) -> dict:
+    """Get the full time series for a UNESCO UIS indicator for one country or region.
+
+    Returns all data points for the indicator × geography combination, optionally
+    filtered to a year range. Ideal for trend analysis and time-series visualisation.
+
+    IMPORTANT — when to omit geo_unit_code:
+    Omit geo_unit_code in ALL cases except when you hold an exact, previously-confirmed
+    code (e.g. "KEN" from a prior elicitation). Never guess or construct a code.
+    When omitted, the tool interactively elicits the geography from the user.
+
+    Args:
+        indicator_code: The indicator code (e.g. "LR.AG15T99").
+        geo_unit_code: Optional. Only pass a code you already hold from a confirmed source.
+                       Omit to trigger geography elicitation.
+        start_year: Optional. First year to include (inclusive).
+        end_year: Optional. Last year to include (inclusive).
+
+    Returns:
+        A dictionary with:
+            - "indicator_code", "indicator_name": Indicator identity.
+            - "geo_unit_code", "geo_unit_name": Geography identity.
+            - "data_points": Chronological list of {year, value, qualifier}.
+            - "summary": {total_data_points, min_value, max_value, latest_year, note}.
+    """
+    if geo_unit_code is None:
+        try:
+            scope_result = await ctx.elicit(
+                "No geography was specified. Would you like to look up data for a specific "
+                "country or region, or get the global value (World)?",
+                response_type=["Specify a country or region", "Get global value (World)"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "error": "Geography not specified and elicitation is unavailable. "
+                         "Please provide a geo_unit_code.",
+                "elicitation_error": f"{type(exc).__name__}: {exc}",
+            }
+
+        if scope_result.action != "accept":
+            return {"error": "No geography provided. Please specify a geo_unit_code."}
+
+        if scope_result.data == "Get global value (World)":
+            search_query = "World"
+        else:
+            try:
+                name_result = await ctx.elicit(
+                    "Enter the name of the country or region (e.g. 'Kenya', 'Sub-Saharan Africa'):",
+                    response_type=str,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "error": "Could not elicit geography name. Please provide a geo_unit_code directly.",
+                    "elicitation_error": f"{type(exc).__name__}: {exc}",
+                }
+
+            if name_result.action != "accept":
+                return {"error": "No geography provided. Please specify a geo_unit_code."}
+
+            search_query = name_result.data.strip()
+
+        geo_results = db_search_geo_units(query_term=search_query)
+        if not geo_results:
+            return {
+                "error": f"No geographic unit found matching '{search_query}'. "
+                         "Use search_geo_units to explore available geographies."
+            }
+
+        resolved = await _resolve_geo_unit(ctx, geo_results, search_query)
+        if resolved is None:
+            return {"error": "Could not resolve geography. Please provide a geo_unit_code directly."}
+
+        geo_unit_code = resolved["code"]
+
+    try:
+        df = uis.get_data(
+            indicator=indicator_code,
+            geoUnit=geo_unit_code,
+            start=start_year,
+            end=end_year,
+            labels=True,
+        )
+    except NoDataError:
+        return {
+            "error": f"No data found for indicator '{indicator_code}' and geography '{geo_unit_code}'. "
+                     "Check that both codes are valid and that this indicator covers this geography."
+        }
+    except TooManyRecordsError:
+        return {
+            "error": "Too many records returned. Try narrowing with start_year and/or end_year."
+        }
+
+    df = df.sort_values("year", ascending=True)
+
+    data_points = [
+        {
+            "year": int(row["year"]),
+            "value": round(float(row["value"]), 6),
+            "qualifier": _safe_qualifier(row),
+        }
+        for _, row in df.iterrows()
+        if not (str(row.get("value", "nan")) == "nan")
+    ]
+
+    values = [p["value"] for p in data_points]
+    first_row = df.iloc[0]
+
+    return {
+        "indicator_code": str(first_row["indicatorId"]),
+        "indicator_name": str(first_row["name"]),
+        "geo_unit_code": str(first_row["geoUnit"]),
+        "geo_unit_name": str(first_row["geoUnitName"]),
+        "data_points": data_points,
+        "summary": {
+            "total_data_points": len(data_points),
+            "min_value": round(min(values), 6) if values else None,
+            "max_value": round(max(values), 6) if values else None,
+            "latest_year": data_points[-1]["year"] if data_points else None,
+            "note": (
+                f"Data from {data_points[0]['year']} to {data_points[-1]['year']}."
+                if len(data_points) >= 2
+                else "Single data point available."
+            ),
+        },
+    }
+
+
+@mcp.tool()
+async def get_country_ranking(
+    indicator_code: str,
+    year: int | None = None,
+    top_n: int = 10,
+    bottom_n: int = 10,
+) -> dict:
+    """Rank countries (not regions) by their value for a UNESCO UIS indicator.
+
+    Returns the top-N and bottom-N countries for a given indicator in a specific year.
+    Uses dense ranking (tied countries share the same rank). When year is omitted,
+    the year with the most country coverage is selected automatically.
+
+    Args:
+        indicator_code: The indicator code (e.g. "LR.AG15T99").
+        year: Optional. The year to rank countries for. If omitted, the year with
+              the most data points is used and reported in the response.
+        top_n: Number of top-ranked countries to return (default 10, max 200).
+        bottom_n: Number of bottom-ranked countries to return (default 10, max 200).
+
+    Returns:
+        A dictionary with:
+            - "indicator_code", "indicator_name": Indicator identity.
+            - "year_used": The year the ranking is based on.
+            - "total_countries_with_data": Countries with non-null values that year.
+            - "top": [{rank, code, name, value}, ...] — highest-value countries.
+            - "bottom": [{rank, code, name, value}, ...] — lowest-value countries.
+            - "note": Context (e.g. year selection rationale, overlap explanation).
+    """
+    top_n = max(1, min(top_n, 200))
+    bottom_n = max(1, min(bottom_n, 200))
+
+    try:
+        df = uis.get_data(
+            indicator=indicator_code,
+            geoUnitType="NATIONAL",
+            start=year,
+            end=year,
+            labels=True,
+        )
+    except NoDataError:
+        return {
+            "error": f"No national-level data found for indicator '{indicator_code}'"
+                     + (f" in {year}." if year else ".")
+        }
+    except TooManyRecordsError:
+        return {
+            "error": "Too many records returned. Try specifying a year."
+        }
+
+    df = df.dropna(subset=["value"])
+
+    if df.empty:
+        return {"error": f"No non-null data found for indicator '{indicator_code}'."}
+
+    if year is None:
+        year_used = int(df["year"].mode()[0])
+        note = f"No year specified — using {year_used} (year with most country coverage)."
+    else:
+        year_used = year
+        note = f"Showing data for {year_used}."
+
+    df = df[df["year"] == year_used].copy()
+
+    if df.empty:
+        return {"error": f"No data for indicator '{indicator_code}' in {year_used}."}
+
+    df = df.sort_values("value", ascending=False).reset_index(drop=True)
+    df["rank"] = df["value"].rank(method="dense", ascending=False).astype(int)
+    total = len(df)
+
+    indicator_name = str(df.iloc[0]["name"])
+
+    if total <= top_n + bottom_n:
+        return {
+            "indicator_code": indicator_code,
+            "indicator_name": indicator_name,
+            "year_used": year_used,
+            "total_countries_with_data": total,
+            "top": _rows_to_ranking(df),
+            "bottom": [],
+            "note": (
+                note + f" Only {total} countries have data — all are shown in 'top'; "
+                "'bottom' is empty to avoid duplication."
+            ),
+        }
+
+    top_df = df.head(top_n)
+    bottom_df = df.tail(bottom_n)
+
+    return {
+        "indicator_code": indicator_code,
+        "indicator_name": indicator_name,
+        "year_used": year_used,
+        "total_countries_with_data": total,
+        "top": _rows_to_ranking(top_df),
+        "bottom": _rows_to_ranking(bottom_df),
+        "note": note,
+    }
+
+
+@mcp.tool()
+async def compare_geographies(
+    indicator_code: str,
+    geo_unit_codes: list[str],
+    year: int | None = None,
+) -> dict:
+    """Compare a UNESCO UIS indicator across a specific list of countries or regions.
+
+    Retrieves the indicator value for each supplied geo unit code and ranks them
+    by value. Use this to directly compare a set of countries or regions you already
+    know the codes for (e.g. from prior searches or elicitations).
+
+    Args:
+        indicator_code: The indicator code (e.g. "LR.AG15T99").
+        geo_unit_codes: List of geo unit codes to compare (max 20, e.g. ["KEN", "TZA", "UGA"]).
+                        Codes must already be known — use search_geo_units to find them.
+        year: Optional. The year to compare. If omitted, the most recent available
+              value for each geography is used (years may differ across geographies).
+
+    Returns:
+        A dictionary with:
+            - "indicator_code", "indicator_name": Indicator identity.
+            - "comparison": [{rank, code, name, value, year, qualifier}, ...] sorted by value desc.
+            - "missing_codes": Geo unit codes for which no data was found.
+            - "note": Context (e.g. mixed years warning, missing codes).
+    """
+    if not geo_unit_codes:
+        return {"error": "geo_unit_codes must be a non-empty list."}
+
+    # Deduplicate preserving order, cap at 20.
+    seen: set[str] = set()
+    unique_codes: list[str] = []
+    for c in geo_unit_codes:
+        if c not in seen:
+            seen.add(c)
+            unique_codes.append(c)
+
+    if len(unique_codes) > 20:
+        return {"error": "Maximum 20 geo unit codes allowed per request."}
+
+    try:
+        df = uis.get_data(
+            indicator=indicator_code,
+            geoUnit=unique_codes,
+            start=year,
+            end=year,
+            labels=True,
+        )
+    except NoDataError:
+        return {
+            "error": f"No data found for indicator '{indicator_code}' with the provided geo unit codes."
+        }
+    except TooManyRecordsError:
+        return {
+            "error": "Too many records returned. Try specifying a year."
+        }
+
+    indicator_name = str(df.iloc[0]["name"]) if not df.empty else indicator_code
+
+    # For each requested code, pick the relevant row.
+    rows: list[dict] = []
+    missing_codes: list[str] = []
+
+    for code in unique_codes:
+        sub = df[df["geoUnit"] == code]
+        if sub.empty:
+            missing_codes.append(code)
+            continue
+
+        if year is not None:
+            filtered = sub[sub["year"] == year]
+            row = filtered.iloc[0] if not filtered.empty else sub.sort_values("year").iloc[-1]
+        else:
+            row = sub.sort_values("year").iloc[-1]
+
+        val = row.get("value")
+        if val is None or str(val) == "nan":
+            missing_codes.append(code)
+            continue
+
+        rows.append({
+            "code": str(row["geoUnit"]),
+            "name": str(row["geoUnitName"]),
+            "value": round(float(val), 6),
+            "year": int(row["year"]),
+            "qualifier": _safe_qualifier(row),
+        })
+
+    # Sort descending and assign dense ranks in pure Python.
+    rows.sort(key=lambda r: r["value"], reverse=True)
+    rank = 1
+    for i, r in enumerate(rows):
+        if i > 0 and r["value"] < rows[i - 1]["value"]:
+            rank = i + 1
+        r["rank"] = rank
+
+    # Build note.
+    notes: list[str] = []
+    if missing_codes:
+        notes.append(f"No data found for: {', '.join(missing_codes)}.")
+    if year is None and rows:
+        years_used = {r["year"] for r in rows}
+        if len(years_used) > 1:
+            notes.append(
+                f"Mixed years used (most recent per geography): "
+                + ", ".join(f"{r['code']}={r['year']}" for r in rows)
+                + "."
+            )
+
+    return {
+        "indicator_code": indicator_code,
+        "indicator_name": indicator_name,
+        "comparison": rows,
+        "missing_codes": missing_codes,
+        "note": " ".join(notes) if notes else None,
+    }
+
+
+@mcp.tool()
+async def get_data_availability(
+    indicator_code: str,
+    geo_unit_type: str | None = None,
+) -> dict:
+    """Show which countries or regions have data for a UNESCO UIS indicator, and for which years.
+
+    Returns a per-geography summary of data coverage: first year, last year, and number
+    of data points. Useful as a pre-check before calling get_country_ranking or
+    compare_geographies, to understand how much data exists and which years are covered.
+
+    Args:
+        indicator_code: The indicator code (e.g. "LR.AG15T99").
+        geo_unit_type: Optional. "NATIONAL" to show only countries, "REGIONAL" for aggregate
+                       regions only. If omitted, returns both.
+
+    Returns:
+        A dictionary with:
+            - "indicator_code", "indicator_name": Indicator identity.
+            - "geographies": [{code, name, type, first_year, last_year, data_points}, ...].
+            - "summary": {total_geographies, total_records, overall_year_min, overall_year_max}.
+            - "note": Additional context, or null.
+    """
+    try:
+        df = uis.get_data(
+            indicator=indicator_code,
+            geoUnitType=geo_unit_type,
+            labels=True,
+        )
+    except NoDataError:
+        return {
+            "error": f"No data found for indicator '{indicator_code}'"
+                     + (f" with geo_unit_type='{geo_unit_type}'." if geo_unit_type else ".")
+        }
+    except TooManyRecordsError:
+        return {
+            "error": "Too many records returned. Try filtering with geo_unit_type='NATIONAL' or 'REGIONAL'."
+        }
+
+    df = df.dropna(subset=["value"])
+    if df.empty:
+        return {"error": f"No non-null data found for indicator '{indicator_code}'."}
+
+    indicator_name = str(df.iloc[0]["name"])
+
+    grouped = (
+        df.groupby(["geoUnit", "geoUnitName"])
+        .agg(
+            first_year=("year", "min"),
+            last_year=("year", "max"),
+            data_points=("year", "count"),
+        )
+        .reset_index()
+        .sort_values("geoUnitName")
+    )
+
+    geographies = [
+        {
+            "code": str(row["geoUnit"]),
+            "name": str(row["geoUnitName"]),
+            "first_year": int(row["first_year"]),
+            "last_year": int(row["last_year"]),
+            "data_points": int(row["data_points"]),
+        }
+        for _, row in grouped.iterrows()
+    ]
+
+    return {
+        "indicator_code": indicator_code,
+        "indicator_name": indicator_name,
+        "geographies": geographies,
+        "summary": {
+            "total_geographies": len(geographies),
+            "total_records": int(df.shape[0]),
+            "overall_year_min": int(df["year"].min()),
+            "overall_year_max": int(df["year"].max()),
+        },
+        "note": None,
+    }
 
 
 async def _resolve_geo_unit(ctx: Context, results: list[dict], query: str) -> dict | None:

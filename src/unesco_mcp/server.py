@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from fastmcp import FastMCP
 import unesco_reader as uis
+from unesco_reader.exceptions import NoDataError
 
 from unesco_mcp.indicator_db import (
     build_db,
@@ -14,6 +15,7 @@ from unesco_mcp.indicator_db import (
     get_themes as db_get_themes,
     get_indicator_summaries as db_get_indicator_summaries,
     get_export_rows as db_get_export_rows,
+    search_geo_units as db_search_geo_units,
     write_export_csv,
     MAX_RESULTS,
     MAX_RESULTS_CAP,
@@ -72,7 +74,13 @@ Example: "Show me primary education completion indicators by sex"
    than get_indicator_metadata. Reserve get_indicator_metadata for when the user needs full
    definitions, methodology, or detailed disaggregation breakdowns for a single indicator.
 
-6. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
+6. USE search_geo_units TO FIND GEOGRAPHY CODES: When the user mentions a country or
+   region by name, call search_geo_units to find the correct code before calling
+   get_latest_value. For regions, multiple grouping systems (WB, SDG, UNICEF, etc.)
+   may match — always ask the user to pick one. ISO3 codes (e.g. "KEN") are resolved
+   directly without FTS search.
+
+8. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
    or get a full/complete list of indicators, use export_indicators — NOT search_indicators.
    Trigger words include: "save", "download", "export", "give me all", "full list", "complete
    list". export_indicators has no result cap and always writes a CSV file to ~/Downloads/.
@@ -481,6 +489,133 @@ async def export_indicators(
     return {
         "saved_to": file_path,
         "row_count": len(rows),
+    }
+
+
+@mcp.tool()
+async def search_geo_units(
+    query: str,
+    type_filter: str | None = None,
+    region_group: str | None = None,
+) -> dict:
+    """Search for UNESCO UIS geographic units (countries and regions) by name or code.
+
+    Use this to find the geo unit code needed for get_latest_value. Accepts either
+    a country/region name (e.g. "Kenya", "Sub-Saharan Africa") or an ISO3 code
+    directly (e.g. "KEN", "ZWE"). When a user mentions a region like "Sub-Saharan
+    Africa", multiple results may be returned from different grouping systems
+    (WB, SDG, UNICEF, etc.) — present these options to the user so they can choose.
+
+    Args:
+        query: Country or region name, or ISO3 code (e.g. "Kenya", "ZWE", "Sub-Saharan Africa").
+        type_filter: Optional. "NATIONAL" to show only countries, "REGIONAL" for aggregates only.
+        region_group: Optional. Restrict to a specific grouping system (e.g. "WB", "SDG", "UNICEF").
+
+    Returns:
+        A dictionary with:
+            - "geo_units": List of matches, each with code, name, type, and region_group.
+            - "count": Number of results returned.
+            - "hint": Guidance on next steps.
+    """
+    results = db_search_geo_units(
+        query_term=query,
+        type_filter=type_filter,
+        region_group=region_group,
+    )
+
+    hint = "Use the 'code' field as the geo_unit_code in get_latest_value."
+    if len(results) > 1:
+        regional = [r for r in results if r["type"] == "REGIONAL"]
+        if regional:
+            hint += (
+                " Multiple regional matches found — each belongs to a different grouping system"
+                " (e.g. WB, SDG, UNICEF). Ask the user which they prefer before proceeding."
+            )
+
+    return {
+        "geo_units": results,
+        "count": len(results),
+        "hint": hint,
+    }
+
+#TODO: data tools - country ranking, visualise trend, country comparison, data export
+
+
+@mcp.tool()
+async def get_latest_value(
+    indicator_code: str,
+    geo_unit_code: str,
+    year: int | None = None,
+) -> dict:
+    """Get the value of a UNESCO UIS indicator for a specific country or region.
+
+    Returns a single data point — either the most recent available value, or the
+    value for a specific year. Use this for answering questions like:
+    "What is the literacy rate in Kenya?" or "What was the completion rate in
+    Sub-Saharan Africa in 2015?"
+
+    To find indicator codes, use search_indicators. To find geo unit codes, use
+    search_geo_units. Always show the user the year alongside the value, since
+    data is not always available for the most recent years.
+
+    Args:
+        indicator_code: The indicator code (e.g. "CR.1", "LR.AG15T99").
+        geo_unit_code: The geo unit code (e.g. "KEN", "SDG: Sub-Saharan Africa").
+        year: Optional. The specific year to retrieve. If omitted, returns the
+              most recent available value. If no data exists for the requested
+              year, returns the nearest available year instead, with a note.
+
+    Returns:
+        A dictionary with:
+            - "indicator_code": The indicator code.
+            - "indicator_name": Full name of the indicator.
+            - "geo_unit_code": The geo unit code.
+            - "geo_unit_name": Human-readable geography name.
+            - "year": The year of the returned value.
+            - "value": The numeric data value.
+            - "qualifier": Data quality flag if present (e.g. "<", "~"), else null.
+            - "note": Context about the data point (e.g. year range, year substitution).
+    """
+    try:
+        df = uis.get_data(indicator=indicator_code, geoUnit=geo_unit_code, labels=True)
+    except NoDataError:
+        return {
+            "error": f"No data found for indicator '{indicator_code}' and geography '{geo_unit_code}'. "
+                     "Check that both codes are valid and that this indicator covers this geography type."
+        }
+
+    year_min = int(df["year"].min())
+    year_max = int(df["year"].max())
+    available_years = sorted(df["year"].tolist())
+
+    if year is not None:
+        row = df[df["year"] == year]
+        if row.empty:
+            # Find the nearest available year to the requested one
+            nearest = min(available_years, key=lambda y: abs(y - year))
+            row = df[df["year"] == nearest]
+            note = (
+                f"No data available for {year}. Showing nearest available year ({nearest}). "
+                f"Data exists from {year_min} to {year_max}."
+            )
+        else:
+            note = f"Data exists from {year_min} to {year_max}."
+    else:
+        row = df[df["year"] == year_max]
+        note = f"Most recent available year. Data exists from {year_min} to {year_max}."
+
+    record = row.iloc[0]
+    qualifier = record["qualifier"] if record["qualifier"] and str(record["qualifier"]) != "nan" else None
+
+    return {
+        "indicator_code": record["indicatorId"],
+        "indicator_name": record["name"],
+        "geo_unit_code": record["geoUnit"],
+        "geo_unit_name": record["geoUnitName"],
+        "year": int(record["year"]),
+        "value": round(float(record["value"]), 6),
+        "qualifier": qualifier,
+        "note": note,
     }
 
 

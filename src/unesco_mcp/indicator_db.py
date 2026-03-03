@@ -265,6 +265,68 @@ def store_geo_units():
         )
 
 
+def search_geo_units(
+    query_term: str,
+    type_filter: str | None = None,
+    region_group: str | None = None,
+) -> list[dict]:
+    """Search geo units by name or exact code.
+
+    Tries an exact code match first (for ISO3 lookups like "ZWE"), then falls
+    back to FTS5 name search. Results from both are merged and deduplicated.
+
+    Args:
+        query_term: A country/region name or ISO3 code to search for.
+        type_filter: Optional. "NATIONAL" or "REGIONAL" to restrict results.
+        region_group: Optional. Filter to a specific region group (e.g. "WB", "SDG").
+
+    Returns:
+        List of matching geo unit dicts with code, name, type, region_group.
+    """
+    conditions: list[str] = []
+    params: list[str] = []
+
+    if type_filter is not None:
+        conditions.append("type = ?")
+        params.append(type_filter.upper())
+
+    if region_group is not None:
+        conditions.append("region_group = ?")
+        params.append(region_group.upper())
+
+    where_suffix = (" AND " + " AND ".join(conditions)) if conditions else ""
+
+    seen: set[str] = set()
+    results: list[dict] = []
+
+    # Exact code match (handles ISO3 like "ZWE" or full regional codes)
+    exact_rows = query(
+        f"SELECT code, name, type, region_group FROM geo_units WHERE code = ?{where_suffix}",
+        tuple([query_term.upper()] + params),
+    )
+    for row in exact_rows:
+        seen.add(row["code"])
+        results.append(row)
+
+    # FTS name search — wrap in double quotes to treat as phrase and avoid
+    # FTS5 interpreting hyphens or spaces as operators (e.g. "Sub-Saharan Africa")
+    fts_query = '"' + query_term.replace('"', '') + '"'
+    fts_rows = query(
+        f"SELECT g.code, g.name, g.type, g.region_group "
+        f"FROM geo_units g "
+        f"JOIN geo_units_fts fts ON fts.code = g.code "
+        f"WHERE geo_units_fts MATCH ?{where_suffix} "
+        f"ORDER BY fts.rank",
+        tuple([fts_query] + params),
+    )
+    for row in fts_rows:
+        if row["code"] not in seen:
+            seen.add(row["code"])
+            results.append(row)
+
+    return results
+
+
 def get_themes() -> list[dict]:
     """Return all themes from the database."""
     return query(

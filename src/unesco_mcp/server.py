@@ -2,7 +2,7 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 import unesco_reader as uis
 from unesco_reader.exceptions import NoDataError
 
@@ -76,9 +76,13 @@ Example: "Show me primary education completion indicators by sex"
 
 6. USE search_geo_units TO FIND GEOGRAPHY CODES: When the user mentions a country or
    region by name, call search_geo_units to find the correct code before calling
-   get_latest_value. For regions, multiple grouping systems (WB, SDG, UNICEF, etc.)
-   may match — always ask the user to pick one. ISO3 codes (e.g. "KEN") are resolved
-   directly without FTS search.
+   get_latest_value. ISO3 codes (e.g. "KEN") are resolved directly without FTS search.
+   For regions with multiple grouping systems (WB, SDG, UNICEF, etc.), the tool will
+   automatically elicit a choice from the user. If the user picks a specific grouping,
+   the tool returns only that result. If the user picks "Let AI choose", the tool
+   returns a recommended grouping — prefer SDG for UNESCO education and literacy data
+   as it aligns with UNESCO's reporting frameworks. You only need to ask the user
+   manually if elicitation is unsupported by the client.
 
 8. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
    or get a full/complete list of indicators, use export_indicators — NOT search_indicators.
@@ -492,8 +496,25 @@ async def export_indicators(
     }
 
 
+_AI_CHOOSE = "Let AI choose the most appropriate"
+
+# Priority order for AI-recommended grouping when the user defers the choice.
+# SDG and UIS align most closely with UNESCO's reporting frameworks; WB and ECA
+# are broader economic groupings; GPE is education-finance-specific.
+_GROUP_PRIORITY = ["SDG", "UIS", "UNICEF", "MDG", "UN", "WB", "ECA", "GPE"]
+
+
+def _pick_recommended_group(available: list[str]) -> str:
+    """Return the highest-priority group present in *available*."""
+    for g in _GROUP_PRIORITY:
+        if g in available:
+            return g
+    return available[0]
+
+
 @mcp.tool()
 async def search_geo_units(
+    ctx: Context,
     query: str,
     type_filter: str | None = None,
     region_group: str | None = None,
@@ -502,9 +523,8 @@ async def search_geo_units(
 
     Use this to find the geo unit code needed for get_latest_value. Accepts either
     a country/region name (e.g. "Kenya", "Sub-Saharan Africa") or an ISO3 code
-    directly (e.g. "KEN", "ZWE"). When a user mentions a region like "Sub-Saharan
-    Africa", multiple results may be returned from different grouping systems
-    (WB, SDG, UNICEF, etc.) — present these options to the user so they can choose.
+    directly (e.g. "KEN", "ZWE"). When multiple grouping systems match a region
+    (WB, SDG, UNICEF, etc.), the tool will elicit a choice from the user directly.
 
     Args:
         query: Country or region name, or ISO3 code (e.g. "Kenya", "ZWE", "Sub-Saharan Africa").
@@ -523,14 +543,83 @@ async def search_geo_units(
         region_group=region_group,
     )
 
-    hint = "Use the 'code' field as the geo_unit_code in get_latest_value."
-    if len(results) > 1:
-        regional = [r for r in results if r["type"] == "REGIONAL"]
-        if regional:
-            hint += (
-                " Multiple regional matches found — each belongs to a different grouping system"
-                " (e.g. WB, SDG, UNICEF). Ask the user which they prefer before proceeding."
+    # Detect ambiguity: regional results with more than one distinct grouping system.
+    regional = [r for r in results if r["type"] == "REGIONAL"]
+    unique_groups: list[str] = []
+    seen_groups: set[str] = set()
+    for r in regional:
+        g = r.get("region_group") or ""
+        if g and g not in seen_groups:
+            seen_groups.add(g)
+            unique_groups.append(g)
+
+    if len(unique_groups) > 1:
+        # Try to elicit a grouping choice from the user.
+        choices = unique_groups + [_AI_CHOOSE]
+        # Identify the single region name for the prompt (use the first regional result's name).
+        region_name = regional[0]["name"] if regional else query
+        try:
+            elicit_result = await ctx.elicit(
+                f"'{region_name}' exists in multiple regional grouping systems: "
+                f"{', '.join(unique_groups)}.\n"
+                f"Which grouping would you like to use? "
+                f"If unsure, choose '{_AI_CHOOSE}'.",
+                response_type=choices,
             )
+        except Exception as exc:  # noqa: BLE001 — elicitation failure is non-fatal
+            # Client does not support MCP elicitation (or it failed) — fall back to text.
+            rec = _pick_recommended_group(unique_groups)
+            return {
+                "geo_units": results,
+                "count": len(results),
+                "requires_user_choice": True,
+                "available_groupings": unique_groups,
+                "ai_recommended_group": rec,
+                "elicitation_error": f"{type(exc).__name__}: {exc}",
+                "hint": (
+                    f"Elicitation failed ({type(exc).__name__}: {exc}). "
+                    f"IMPORTANT: Before calling get_latest_value, you MUST ask the user "
+                    f"which grouping system to use: {', '.join(unique_groups)}. "
+                    f"If the user is unsure, suggest '{rec}' as it aligns best with "
+                    f"UNESCO's reporting frameworks. Do NOT proceed without confirming."
+                ),
+            }
+
+        if elicit_result is not None and elicit_result.action == "accept":
+            chosen = elicit_result.data
+            if chosen == _AI_CHOOSE:
+                # Return all results but flag the recommended grouping.
+                rec = _pick_recommended_group(unique_groups)
+                return {
+                    "geo_units": results,
+                    "count": len(results),
+                    "ai_recommended_group": rec,
+                    "hint": (
+                        f"Use the 'code' field as geo_unit_code in get_latest_value. "
+                        f"The AI-recommended grouping is '{rec}' as it aligns best with "
+                        f"UNESCO's reporting frameworks."
+                    ),
+                }
+            else:
+                # Filter to the chosen grouping only.
+                filtered = [r for r in results if r.get("region_group") == chosen or r["type"] == "NATIONAL"]
+                return {
+                    "geo_units": filtered,
+                    "count": len(filtered),
+                    "hint": (
+                        f"Filtered to '{chosen}' grouping. "
+                        f"Use the 'code' field as geo_unit_code in get_latest_value."
+                    ),
+                }
+        # User declined/cancelled — return everything and prompt manual choice.
+
+    hint = "Use the 'code' field as the geo_unit_code in get_latest_value."
+    if len(unique_groups) > 1:
+        rec = _pick_recommended_group(unique_groups)
+        hint += (
+            f" Multiple regional grouping systems found ({', '.join(unique_groups)}). "
+            f"Ask the user which grouping to use, or suggest '{rec}' for UNESCO education data."
+        )
 
     return {
         "geo_units": results,

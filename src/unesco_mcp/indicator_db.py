@@ -1,7 +1,6 @@
 """SQLite database for caching UNESCO UIS indicators and disaggregation metadata."""
 
 import csv
-import io
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -514,7 +513,6 @@ EXPORT_FIELDNAMES = [
     "code", "name", "theme", "timeLine_min", "timeLine_max",
     "totalRecordCount", "lastDataUpdate", "disaggregation_types",
 ]
-EXPORT_INLINE_LIMIT = 100
 
 
 def get_export_rows(
@@ -573,15 +571,6 @@ def get_export_rows(
         ind["disaggregation_types"] = "; ".join(disagg_by_code.get(ind["code"], []))
 
     return indicators
-
-
-def rows_to_csv_string(rows: list[dict]) -> str:
-    """Serialise export rows to a CSV string."""
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=EXPORT_FIELDNAMES)
-    writer.writeheader()
-    writer.writerows(rows)
-    return buf.getvalue()
 
 
 def write_export_csv(rows: list[dict], label: str = "indicators") -> str:

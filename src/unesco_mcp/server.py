@@ -14,9 +14,7 @@ from unesco_mcp.indicator_db import (
     get_themes as db_get_themes,
     get_indicator_summaries as db_get_indicator_summaries,
     get_export_rows as db_get_export_rows,
-    rows_to_csv_string,
     write_export_csv,
-    EXPORT_INLINE_LIMIT,
     MAX_RESULTS,
     MAX_RESULTS_CAP,
     MAX_SUMMARY_CODES,
@@ -77,7 +75,8 @@ Example: "Show me primary education completion indicators by sex"
 6. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
    or get a full/complete list of indicators, use export_indicators — NOT search_indicators.
    Trigger words include: "save", "download", "export", "give me all", "full list", "complete
-   list". export_indicators has no result cap and writes a CSV file the user can access.
+   list". export_indicators has no result cap and always writes a CSV file to ~/Downloads/.
+   After calling it, ALWAYS tell the user exactly: "Saved {row_count} indicators to: {saved_to}"
 
 Example: "How many education indicators have data from 2010 to 2020?"
   → list_themes → find education theme code
@@ -447,18 +446,17 @@ async def export_indicators(
     disaggregation_types: list[str] | None = None,
     disaggregation_values: list[str] | None = None,
 ) -> dict:
-    """Export matching UNESCO UIS indicators to CSV.
+    """Export matching UNESCO UIS indicators to a CSV file.
 
     Use this tool whenever the user wants to save, download, export, or get a full
     list of indicators — even if they just say "give me all education indicators" or
     "save the results". Unlike search_indicators (which caps results at 50), this
-    fetches every match with no limit.
-
-    Small results (≤ 100 rows) are returned inline as CSV text so you can display
-    them directly in chat. Larger results are written to ~/Downloads/ and you must
-    tell the user the exact file path.
+    fetches every match with no limit and writes a CSV file to ~/Downloads/.
 
     At least one filter must be provided.
+
+    After calling this tool, ALWAYS tell the user exactly:
+    "Saved {row_count} indicators to: {saved_to}"
 
     Args:
         query: Full-text search on indicator name (FTS5 with stemming).
@@ -467,11 +465,7 @@ async def export_indicators(
         disaggregation_values: List of disaggregation value codes. Indicators must match ALL listed values.
 
     Returns:
-        One of two shapes:
-        - Inline (≤ 100 rows): {"csv": "<csv text>", "row_count": N, "delivery": "inline"}
-        - File  (> 100 rows):  {"file_path": "/path/to/file.csv", "row_count": N, "delivery": "file",
-                                 "preview": "<first 5 rows as csv>"}
-          When delivery is "file", tell the user: "Your indicators have been saved to: <file_path>"
+        {"saved_to": "/absolute/path/to/file.csv", "row_count": N}
     """
     if not any([query, theme, disaggregation_types, disaggregation_values]):
         return {"error": "At least one filter parameter must be provided."}
@@ -482,22 +476,11 @@ async def export_indicators(
         disaggregation_types=disaggregation_types,
         disaggregation_values=disaggregation_values,
     )
-    row_count = len(rows)
-
-    if row_count <= EXPORT_INLINE_LIMIT:
-        return {
-            "csv": rows_to_csv_string(rows),
-            "row_count": row_count,
-            "delivery": "inline",
-        }
 
     file_path = write_export_csv(rows)
     return {
-        "file_path": file_path,
-        "row_count": row_count,
-        "delivery": "file",
-        "preview": rows_to_csv_string(rows[:5]),
-        "instruction": f"Tell the user: 'Your {row_count} indicators have been saved to: {file_path}'",
+        "saved_to": file_path,
+        "row_count": len(rows),
     }
 
 

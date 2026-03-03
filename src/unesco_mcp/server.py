@@ -74,15 +74,17 @@ Example: "Show me primary education completion indicators by sex"
    than get_indicator_metadata. Reserve get_indicator_metadata for when the user needs full
    definitions, methodology, or detailed disaggregation breakdowns for a single indicator.
 
-6. USE search_geo_units TO FIND GEOGRAPHY CODES: When the user mentions a country or
-   region by name, call search_geo_units to find the correct code before calling
-   get_latest_value. ISO3 codes (e.g. "KEN") are resolved directly without FTS search.
-   For regions with multiple grouping systems (WB, SDG, UNICEF, etc.), the tool will
-   automatically elicit a choice from the user. If the user picks a specific grouping,
-   the tool returns only that result. If the user picks "Let AI choose", the tool
-   returns a recommended grouping — prefer SDG for UNESCO education and literacy data
-   as it aligns with UNESCO's reporting frameworks. You only need to ask the user
-   manually if elicitation is unsupported by the client.
+6. GEOGRAPHY RESOLUTION FOR get_latest_value — single clear rule:
+   - OMIT geo_unit_code (do not pass it) in ALL cases EXCEPT when you already hold an
+     exact, previously-confirmed code from a prior elicitation or from a user who typed
+     a raw ISO3 code (e.g. "KEN", "ZWE"). When geo_unit_code is omitted, get_latest_value
+     will elicit the geography, name, and grouping (if ambiguous) directly from the user.
+   - NEVER guess or construct a geo unit code yourself (e.g. "SDG: Sub-Saharan Africa").
+     Even if the user names a country or region, omit the code so the elicitation chain
+     runs. The tool will search and disambiguate automatically.
+   - Use search_geo_units ONLY for pure geography discovery (e.g. "what regions are
+     available?", "show me countries in Africa") — never as a mandatory pre-step before
+     get_latest_value.
 
 8. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
    or get a full/complete list of indicators, use export_indicators — NOT search_indicators.
@@ -630,10 +632,66 @@ async def search_geo_units(
 #TODO: data tools - country ranking, visualise trend, country comparison, data export
 
 
+async def _resolve_geo_unit(ctx: Context, results: list[dict], query: str) -> dict | None:
+    """Resolve a list of geo unit search results to a single unit.
+
+    When multiple grouping systems are present (e.g. WB, SDG, UNICEF for the same
+    region name), elicits a choice from the user. On elicitation failure or cancel,
+    falls back to the highest-priority recommended group.
+
+    Returns the resolved geo unit dict, or None if there are no results.
+    """
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+
+    # Collect distinct grouping systems from regional results, preserving encounter order.
+    regional = [r for r in results if r["type"] == "REGIONAL"]
+    unique_groups: list[str] = []
+    seen: set[str] = set()
+    for r in regional:
+        g = r.get("region_group") or ""
+        if g and g not in seen:
+            seen.add(g)
+            unique_groups.append(g)
+
+    chosen_group: str | None = None
+
+    if len(unique_groups) > 1:
+        region_name = regional[0]["name"] if regional else query
+        try:
+            elicit_result = await ctx.elicit(
+                f"'{region_name}' exists in multiple regional grouping systems: "
+                f"{', '.join(unique_groups)}.\n"
+                f"Which grouping would you like to use? "
+                f"If unsure, choose '{_AI_CHOOSE}'.",
+                response_type=unique_groups + [_AI_CHOOSE],
+            )
+            if elicit_result.action == "accept":
+                chosen_group = elicit_result.data
+        except Exception:  # noqa: BLE001
+            pass  # fall through to recommended group
+
+        if chosen_group is None or chosen_group == _AI_CHOOSE:
+            chosen_group = _pick_recommended_group(unique_groups)
+
+        filtered = [r for r in results if r.get("region_group") == chosen_group]
+        if filtered:
+            # Within the chosen group, prefer an exact name match over a partial one.
+            exact = [r for r in filtered if r["name"].lower() == query.lower()]
+            return exact[0] if exact else filtered[0]
+
+    # Single grouping or purely national results — prefer exact name match, else first.
+    exact = [r for r in results if r["name"].lower() == query.lower()]
+    return exact[0] if exact else results[0]
+
+
 @mcp.tool()
 async def get_latest_value(
+    ctx: Context,
     indicator_code: str,
-    geo_unit_code: str,
+    geo_unit_code: str | None = None,
     year: int | None = None,
 ) -> dict:
     """Get the value of a UNESCO UIS indicator for a specific country or region.
@@ -643,13 +701,20 @@ async def get_latest_value(
     "What is the literacy rate in Kenya?" or "What was the completion rate in
     Sub-Saharan Africa in 2015?"
 
-    To find indicator codes, use search_indicators. To find geo unit codes, use
-    search_geo_units. Always show the user the year alongside the value, since
-    data is not always available for the most recent years.
+    IMPORTANT — when to omit geo_unit_code:
+    Omit geo_unit_code in ALL cases except when you hold an exact, previously-confirmed
+    code (e.g. a raw ISO3 country code like "KEN", or a code returned by a prior
+    elicitation). Never construct or guess a code yourself (e.g. "SDG: Sub-Saharan Africa").
+    When omitted, the tool interactively elicits the geography, handles name lookup, and
+    disambiguates grouping systems (WB, SDG, UNICEF, etc.) before fetching data.
+
+    To find indicator codes, use search_indicators. Always show the user the year
+    alongside the value, since data is not always available for the most recent years.
 
     Args:
         indicator_code: The indicator code (e.g. "CR.1", "LR.AG15T99").
-        geo_unit_code: The geo unit code (e.g. "KEN", "SDG: Sub-Saharan Africa").
+        geo_unit_code: Optional. Only pass a code you already hold from a confirmed
+                       source (e.g. "KEN"). Omit to trigger the geography elicitation.
         year: Optional. The specific year to retrieve. If omitted, returns the
               most recent available value. If no data exists for the requested
               year, returns the nearest available year instead, with a note.
@@ -665,6 +730,58 @@ async def get_latest_value(
             - "qualifier": Data quality flag if present (e.g. "<", "~"), else null.
             - "note": Context about the data point (e.g. year range, year substitution).
     """
+    if geo_unit_code is None:
+        # Step 1 — ask the user whether to specify a geography or use the global value.
+        try:
+            scope_result = await ctx.elicit(
+                "No geography was specified. Would you like to look up data for a specific "
+                "country or region, or get the global value (World)?",
+                response_type=["Specify a country or region", "Get global value (World)"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "error": "Geography not specified and elicitation is unavailable. "
+                         "Please provide a geo_unit_code. Use search_geo_units to find the correct code.",
+                "elicitation_error": f"{type(exc).__name__}: {exc}",
+            }
+
+        if scope_result.action != "accept":
+            return {"error": "No geography provided. Please specify a geo_unit_code."}
+
+        if scope_result.data == "Get global value (World)":
+            search_query = "World"
+        else:
+            # Step 2 — elicit the country or region name.
+            try:
+                name_result = await ctx.elicit(
+                    "Enter the name of the country or region (e.g. 'Kenya', 'Sub-Saharan Africa'):",
+                    response_type=str,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "error": "Could not elicit geography name. Please provide a geo_unit_code directly.",
+                    "elicitation_error": f"{type(exc).__name__}: {exc}",
+                }
+
+            if name_result.action != "accept":
+                return {"error": "No geography provided. Please specify a geo_unit_code."}
+
+            search_query = name_result.data.strip()
+
+        # Step 3 — look up the geography, resolving grouping ambiguity via elicitation.
+        geo_results = db_search_geo_units(query_term=search_query)
+        if not geo_results:
+            return {
+                "error": f"No geographic unit found matching '{search_query}'. "
+                         "Use search_geo_units to explore available geographies."
+            }
+
+        resolved = await _resolve_geo_unit(ctx, geo_results, search_query)
+        if resolved is None:
+            return {"error": "Could not resolve geography. Please provide a geo_unit_code directly."}
+
+        geo_unit_code = resolved["code"]
+
     try:
         df = uis.get_data(indicator=indicator_code, geoUnit=geo_unit_code, labels=True)
     except NoDataError:

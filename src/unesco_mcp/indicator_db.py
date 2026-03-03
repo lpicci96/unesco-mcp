@@ -86,6 +86,28 @@ def _indicator_disaggregations_table():
            '''
 
 
+def _geo_units_table():
+    """Return CREATE TABLE statement for the geo_units table."""
+
+    return """
+           CREATE TABLE IF NOT EXISTS geo_units
+           (code         TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            type         TEXT NOT NULL,
+            region_group TEXT
+           )
+           """
+
+
+def _geo_units_fts_table():
+    """Return CREATE VIRTUAL TABLE statement for FTS5 full-text search on geo unit names."""
+
+    return """
+           CREATE VIRTUAL TABLE IF NOT EXISTS geo_units_fts
+           USING fts5(code UNINDEXED, name, tokenize='porter unicode61')
+           """
+
+
 def _themes_table():
     """Return CREATE TABLE statement for the themes table."""
 
@@ -120,6 +142,10 @@ def _indexes():
         # Disaggregation values: lookup by type_id, by name
         "CREATE INDEX IF NOT EXISTS idx_disaggregation_values_type_id ON disaggregation_values (type_id)",
         "CREATE INDEX IF NOT EXISTS idx_disaggregation_values_name ON disaggregation_values (name)",
+
+        # Geo units: filter by type (NATIONAL/REGIONAL) and region_group
+        "CREATE INDEX IF NOT EXISTS idx_geo_units_type ON geo_units (type)",
+        "CREATE INDEX IF NOT EXISTS idx_geo_units_region_group ON geo_units (region_group)",
     ]
 
 
@@ -131,6 +157,8 @@ def init_db():
 
         cursor.execute(_indicators_table())
         cursor.execute(_themes_table())
+        cursor.execute(_geo_units_table())
+        cursor.execute(_geo_units_fts_table())
         cursor.execute(_fts_table())
         cursor.execute(_disaggregations_type_table())
         cursor.execute(_disaggregations_values_table())
@@ -207,6 +235,34 @@ def store_themes():
             (code, name, last_update, last_update_description, indicator_count)
             VALUES (?, ?, ?, ?, ?)
             """, rows)
+
+
+def store_geo_units():
+    """Fetch all geographic units from the UIS API and store in the geo_units table."""
+
+    df = uis.available_geo_units()
+
+    rows = [
+        (
+            row["id"],
+            row["name"],
+            row["type"],
+            row["regionGroup"] if row["regionGroup"] else None,
+        )
+        for _, row in df.iterrows()
+    ]
+
+    with _get_connection() as conn:
+        conn.executemany("""
+            INSERT OR REPLACE INTO geo_units (code, name, type, region_group)
+            VALUES (?, ?, ?, ?)
+            """, rows)
+
+        conn.execute("DELETE FROM geo_units_fts")
+        conn.executemany(
+            "INSERT INTO geo_units_fts (code, name) VALUES (?, ?)",
+            [(code, name) for code, name, *_ in rows],
+        )
 
 
 def get_themes() -> list[dict]:
@@ -609,6 +665,7 @@ def build_db(fresh: bool = False):
     init_db()
     store_indicators()
     store_themes()
+    store_geo_units()
 
     disaggregations = get_disaggregations()
     store_disaggregation_types(disaggregations)

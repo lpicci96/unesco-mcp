@@ -17,6 +17,7 @@ from unesco_mcp.indicator_db import (
     get_export_rows as db_get_export_rows,
     search_geo_units as db_search_geo_units,
     write_export_csv,
+    write_data_csv,
     MAX_RESULTS,
     MAX_RESULTS_CAP,
     MAX_SUMMARY_CODES,
@@ -49,6 +50,14 @@ mcp = FastMCP(
 2. MAP USER CONCEPTS TO CODES: Common mappings include education levels, sex, age groups,
    wealth quintiles, and geographic regions. Never guess codes — always look them up.
 
+DISAGGREGATIONS ARE SEPARATE INDICATORS: Each disaggregated data series has its own
+indicator code. "Literacy rate (female)" and "Literacy rate (total)" are different indicator
+codes. The disaggregation filters in search_indicators are for *discovery* — finding the
+right indicator code for the breakdown the user wants. Once you have the right indicator code,
+pass it directly to get_latest_value / get_time_series / etc. There is no disaggregation
+parameter on the data retrieval tools. The indicator code itself determines what breakdown
+is returned.
+
 3. SEARCH WITH STRUCTURED FILTERS: search_indicators has two independent disaggregation filters:
    - disaggregation_types: a list of type codes (e.g. ["SEX", "EDU_LEVEL"]). Indicators must
      support ALL listed types. Use this to ensure data can be broken down in the ways the user needs.
@@ -76,15 +85,21 @@ Example: "Show me primary education completion indicators by sex"
 
 6. GEOGRAPHY RESOLUTION — single clear rule for get_latest_value AND get_time_series:
    - OMIT geo_unit_code (do not pass it) in ALL cases EXCEPT when you already hold an
-     exact, previously-confirmed code from a prior elicitation or from a user who typed
-     a raw ISO3 code (e.g. "KEN", "ZWE"). When geo_unit_code is omitted, the tool will
-     elicit the geography, name, and grouping (if ambiguous) directly from the user.
-   - NEVER guess or construct a geo unit code yourself (e.g. "SDG: Sub-Saharan Africa").
-     Even if the user names a country or region, omit the code so the elicitation chain
-     runs. The tool will search and disambiguate automatically.
-   - Use search_geo_units ONLY for pure geography discovery (e.g. "what regions are
-     available?", "show me countries in Africa") — never as a mandatory pre-step before
-     get_latest_value or get_time_series.
+     exact, previously-confirmed code from a prior tool result (e.g. a code returned by
+     search_geo_units after the user confirmed a grouping, or a raw ISO3 code the user
+     typed directly like "KEN" or "ZWE"). When geo_unit_code is omitted the tool handles
+     geography lookup and grouping disambiguation automatically.
+   - NEVER guess, construct, or look up a geo_unit_code yourself — not even for regions
+     the user named explicitly (e.g. "Sub-Saharan Africa", "East Asia"). Always omit
+     geo_unit_code and let the tool do the lookup. Regional names map to multiple codes
+     depending on grouping system (WB, SDG, UNICEF, etc.), and the tool must ask the
+     user to choose. If you construct a code you will silently pick the wrong grouping.
+   - If the tool returns "geography_disambiguation_required": ask the user which
+     grouping system to use (present the available_groupings list), then call
+     search_geo_units(query=region_name, region_group=<chosen>) to get the exact code,
+     then retry the tool with that geo_unit_code.
+   - NEVER call search_geo_units as a pre-step before get_latest_value or get_time_series
+     unless the user explicitly asks to explore or list geographies.
 
 7. DATA RETRIEVAL — choose the right tool:
    - Single data point (latest or specific year) → get_latest_value
@@ -94,14 +109,24 @@ Example: "Show me primary education completion indicators by sex"
      (no geography argument needed; returns top-N and bottom-N countries only, not regions)
    - Compare a specific set of countries or regions → compare_geographies
      (pass pre-confirmed geo_unit_codes; supports up to 20 codes; ranks by value)
-   - Check data coverage before ranking or comparing → get_data_availability
-     (shows which geographies and years have data; use to verify indicator coverage)
 
-8. USE export_indicators FOR CSV EXPORTS: When the user wants to save, download, export,
-   or get a full/complete list of indicators, use export_indicators — NOT search_indicators.
-   Trigger words include: "save", "download", "export", "give me all", "full list", "complete
-   list". export_indicators has no result cap and always writes a CSV file to ~/Downloads/.
-   After calling it, ALWAYS tell the user exactly: "Saved {row_count} indicators to: {saved_to}"
+8. CSV EXPORTS — choose the right export tool:
+   - export_indicators: Exports the indicator *catalog* (names, codes, themes, coverage).
+     Use when the user wants to save or download a list of indicators. At least one filter
+     required. After calling, ALWAYS tell the user: "Saved {row_count} indicators to: {saved_to}"
+   - export_data: Exports actual *numeric data values* (time series) to CSV.
+     TWO PATTERNS:
+     (a) ALL INDICATORS FOR A GEOGRAPHY: omit indicator_codes, provide geo_unit_codes or
+         geo_unit_type. E.g. export_data(geo_unit_codes=["KEN"]) fetches every indicator
+         for Kenya. This will NOT hit API limits.
+     (b) SPECIFIC INDICATORS: provide indicator_codes (from search_indicators), optionally
+         scoped to a geography. To find the right codes, use search_indicators FIRST —
+         prioritise structured filters (theme, disaggregation_types, disaggregation_values)
+         over the text query parameter, as they are far more reliable for topic discovery.
+     At least one of indicator_codes or a geography filter is required.
+     After calling, ALWAYS tell the user: "Saved {row_count} data rows to: {saved_to}"
+   Trigger words for either: "save", "download", "export", "give me all", "full list", "complete
+   list". Choose based on whether the user wants indicator metadata or actual data values.
 
 Example: "How many education indicators have data from 2010 to 2020?"
   → list_themes → find education theme code
@@ -509,6 +534,111 @@ async def export_indicators(
     }
 
 
+@mcp.tool()
+async def export_data(
+    indicator_codes: list[str] | None = None,
+    geo_unit_codes: list[str] | None = None,
+    geo_unit_type: str | None = None,
+    start_year: int | None = None,
+    end_year: int | None = None,
+) -> dict:
+    """Export actual numeric data values for UNESCO UIS indicators to a CSV file.
+
+    Use this tool when the user wants to download or save the data itself (time series
+    values by year and geography) — not the indicator catalog. For exporting the indicator
+    catalog (names, codes, themes), use export_indicators instead.
+
+    TWO USAGE PATTERNS:
+
+    1. ALL INDICATORS FOR A GEOGRAPHY — omit indicator_codes, provide geography:
+       export_data(geo_unit_codes=["KEN"])  →  all indicators for Kenya
+       export_data(geo_unit_type="NATIONAL")  →  all indicators for all countries
+       This does NOT hit API limits; the API returns one geography's full dataset.
+
+    2. SPECIFIC INDICATORS ACROSS GEOGRAPHIES — provide indicator_codes, omit or specify geography:
+       export_data(indicator_codes=["LR.1", "LR.2"])  →  those indicators for all geographies
+       export_data(indicator_codes=["LR.1"], geo_unit_type="NATIONAL")  →  national only
+       To find indicator codes for a topic, call search_indicators FIRST using structured
+       filters (theme, disaggregation_types, disaggregation_values) — these are far more
+       reliable than the text query. Only use query as a secondary refinement. Then pass the
+       returned codes here.
+
+    At least one of indicator_codes or a geography filter must be provided.
+    geo_unit_codes and geo_unit_type are mutually exclusive (max 20 geo_unit_codes).
+
+    After calling this tool, ALWAYS tell the user:
+    "Saved {row_count} data rows to: {saved_to}"
+
+    Args:
+        indicator_codes: Optional list of indicator codes. Omit to fetch all indicators for
+                         the given geography. Use search_indicators to find codes first.
+        geo_unit_codes: Optional list of specific geo unit codes (max 20).
+                        Mutually exclusive with geo_unit_type.
+        geo_unit_type: Optional. "NATIONAL" for all countries, "REGIONAL" for all regions.
+                       Mutually exclusive with geo_unit_codes.
+        start_year: Optional. First year to include (inclusive).
+        end_year: Optional. Last year to include (inclusive).
+
+    Returns:
+        {"saved_to": "/absolute/path/to/file.csv", "row_count": N}
+    """
+    has_indicators = bool(indicator_codes)
+    has_geography = bool(geo_unit_codes) or geo_unit_type is not None
+    if not has_indicators and not has_geography:
+        return {"error": "At least one of indicator_codes or a geography filter (geo_unit_codes or geo_unit_type) must be provided. Fetching all UNESCO data at once is not supported."}
+
+    if geo_unit_codes and geo_unit_type:
+        return {"error": "geo_unit_codes and geo_unit_type are mutually exclusive. Provide one or the other, not both."}
+
+    if geo_unit_codes and len(geo_unit_codes) > 20:
+        return {"error": f"geo_unit_codes is capped at 20 entries. {len(geo_unit_codes)} were provided. Use geo_unit_type='NATIONAL' to fetch all countries instead."}
+
+    try:
+        df = uis.get_data(
+            indicator=indicator_codes,
+            geoUnit=geo_unit_codes,
+            geoUnitType=geo_unit_type,
+            start=start_year,
+            end=end_year,
+            labels=True,
+        )
+    except NoDataError:
+        return {
+            "error": (
+                "No data found for the given filters. "
+                "Check that the indicator codes and geography codes are valid and that data "
+                "exists for the specified combination and year range."
+            )
+        }
+    except TooManyRecordsError:
+        return {
+            "error": (
+                "Too many records returned by the API. Narrow the request by passing "
+                "fewer indicator_codes, using geo_unit_type instead of no geography filter, "
+                "passing fewer geo_unit_codes, or adding a tighter year range."
+            )
+        }
+
+    rows = [
+        {
+            "indicator_code": str(row["indicatorId"]),
+            "indicator_name": str(row["name"]),
+            "geo_unit_code": str(row["geoUnit"]),
+            "geo_unit_name": str(row["geoUnitName"]),
+            "year": int(row["year"]),
+            "value": round(float(row["value"]), 6) if str(row.get("value", "nan")) != "nan" else None,
+            "qualifier": _safe_qualifier(row),
+        }
+        for _, row in df.iterrows()
+    ]
+
+    file_path = write_data_csv(rows)
+    return {
+        "saved_to": file_path,
+        "row_count": len(rows),
+    }
+
+
 _AI_CHOOSE = "Let AI choose the most appropriate"
 
 # Priority order for AI-recommended grouping when the user defers the choice.
@@ -676,13 +806,19 @@ async def get_time_series(
 
     IMPORTANT — when to omit geo_unit_code:
     Omit geo_unit_code in ALL cases except when you hold an exact, previously-confirmed
-    code (e.g. "KEN" from a prior elicitation). Never guess or construct a code.
-    When omitted, the tool interactively elicits the geography from the user.
+    code from a prior tool result. NEVER construct or guess a code yourself — regional
+    names (e.g. "Sub-Saharan Africa") map to multiple codes across grouping systems
+    (WB, SDG, UNICEF, etc.) and the wrong one gives wrong data. When omitted, the tool
+    handles geography lookup and grouping disambiguation automatically.
+
+    If the tool returns error="geography_disambiguation_required", ask the user which
+    grouping system to use, then call search_geo_units(query=region_name,
+    region_group=<chosen>) to get the exact code, and retry with that geo_unit_code.
 
     Args:
         indicator_code: The indicator code (e.g. "LR.AG15T99").
-        geo_unit_code: Optional. Only pass a code you already hold from a confirmed source.
-                       Omit to trigger geography elicitation.
+        geo_unit_code: Optional. Only pass a confirmed code from a prior tool result.
+                       Omit to trigger geography lookup and disambiguation.
         start_year: Optional. First year to include (inclusive).
         end_year: Optional. Last year to include (inclusive).
 
@@ -739,6 +875,24 @@ async def get_time_series(
         resolved = await _resolve_geo_unit(ctx, geo_results, search_query)
         if resolved is None:
             return {"error": "Could not resolve geography. Please provide a geo_unit_code directly."}
+        if resolved.get("_disambiguation_required"):
+            groups = resolved["available_groupings"]
+            rec = resolved["ai_recommended_group"]
+            name = resolved["region_name"]
+            return {
+                "error": "geography_disambiguation_required",
+                "region_name": name,
+                "available_groupings": groups,
+                "recommended_grouping": rec,
+                "instruction": (
+                    f"'{name}' exists in multiple regional grouping systems: "
+                    f"{', '.join(groups)}. You MUST ask the user which grouping to use. "
+                    f"Suggest '{rec}' as a sensible default (aligns with UNESCO/SDG reporting). "
+                    f"Once the user chooses, call search_geo_units(query='{name}', "
+                    f"region_group='<chosen>') to get the exact code, then retry this tool "
+                    f"with geo_unit_code set to that code."
+                ),
+            }
 
         geo_unit_code = resolved["code"]
 
@@ -801,19 +955,24 @@ async def get_country_ranking(
     year: int | None = None,
     top_n: int = 10,
     bottom_n: int = 10,
+    strict_year: bool = True,
 ) -> dict:
     """Rank countries (not regions) by their value for a UNESCO UIS indicator.
 
     Returns the top-N and bottom-N countries for a given indicator in a specific year.
-    Uses dense ranking (tied countries share the same rank). When year is omitted,
-    the year with the most country coverage is selected automatically.
+    Uses dense ranking (tied countries share the same rank).
+
+    Year handling:
+    - strict_year=True (default): year must be provided explicitly.
+    - strict_year=False and year omitted: uses the year with the most country coverage.
 
     Args:
         indicator_code: The indicator code (e.g. "LR.AG15T99").
         year: Optional. The year to rank countries for. If omitted, the year with
-              the most data points is used and reported in the response.
+              the most data points is used only when strict_year=False.
         top_n: Number of top-ranked countries to return (default 10, max 200).
         bottom_n: Number of bottom-ranked countries to return (default 10, max 200).
+        strict_year: If True, require an explicit year to avoid implicit year selection.
 
     Returns:
         A dictionary with:
@@ -826,6 +985,15 @@ async def get_country_ranking(
     """
     top_n = max(1, min(top_n, 200))
     bottom_n = max(1, min(bottom_n, 200))
+
+    if strict_year and year is None:
+        return {
+            "error": (
+                "strict_year=True requires an explicit 'year'. "
+                "Provide year=<YYYY>, or set strict_year=False to auto-select the year "
+                "with the most country coverage."
+            )
+        }
 
     try:
         df = uis.get_data(
@@ -901,6 +1069,7 @@ async def compare_geographies(
     indicator_code: str,
     geo_unit_codes: list[str],
     year: int | None = None,
+    strict_year: bool = True,
 ) -> dict:
     """Compare a UNESCO UIS indicator across a specific list of countries or regions.
 
@@ -908,12 +1077,20 @@ async def compare_geographies(
     by value. Use this to directly compare a set of countries or regions you already
     know the codes for (e.g. from prior searches or elicitations).
 
+    Year handling:
+    - strict_year=True (default): year must be provided; if a geography has no value in
+      that year, it is reported in missing_codes (no fallback year used).
+    - strict_year=False:
+      - year provided: falls back to the nearest available year per geography.
+      - year omitted: uses the most recent available year per geography (mixed years possible).
+
     Args:
         indicator_code: The indicator code (e.g. "LR.AG15T99").
         geo_unit_codes: List of geo unit codes to compare (max 20, e.g. ["KEN", "TZA", "UGA"]).
                         Codes must already be known — use search_geo_units to find them.
         year: Optional. The year to compare. If omitted, the most recent available
-              value for each geography is used (years may differ across geographies).
+              value for each geography is used only when strict_year=False.
+        strict_year: If True, require an explicit year and disallow fallback years.
 
     Returns:
         A dictionary with:
@@ -924,6 +1101,15 @@ async def compare_geographies(
     """
     if not geo_unit_codes:
         return {"error": "geo_unit_codes must be a non-empty list."}
+
+    if strict_year and year is None:
+        return {
+            "error": (
+                "strict_year=True requires an explicit 'year'. "
+                "Provide year=<YYYY>, or set strict_year=False to allow per-geography "
+                "fallback years."
+            )
+        }
 
     # Deduplicate preserving order, cap at 20.
     seen: set[str] = set()
@@ -958,6 +1144,7 @@ async def compare_geographies(
     # For each requested code, pick the relevant row.
     rows: list[dict] = []
     missing_codes: list[str] = []
+    substituted_years: list[str] = []
 
     for code in unique_codes:
         sub = df[df["geoUnit"] == code]
@@ -967,7 +1154,15 @@ async def compare_geographies(
 
         if year is not None:
             filtered = sub[sub["year"] == year]
-            row = filtered.iloc[0] if not filtered.empty else sub.sort_values("year").iloc[-1]
+            if not filtered.empty:
+                row = filtered.iloc[0]
+            elif strict_year:
+                missing_codes.append(code)
+                continue
+            else:
+                nearest = min(sub["year"].tolist(), key=lambda y: abs(int(y) - year))
+                row = sub[sub["year"] == nearest].iloc[0]
+                substituted_years.append(f"{code}:{year}->{int(nearest)}")
         else:
             row = sub.sort_values("year").iloc[-1]
 
@@ -996,6 +1191,10 @@ async def compare_geographies(
     notes: list[str] = []
     if missing_codes:
         notes.append(f"No data found for: {', '.join(missing_codes)}.")
+    if substituted_years:
+        notes.append(
+            "Requested year substitutions used: " + ", ".join(substituted_years) + "."
+        )
     if year is None and rows:
         years_used = {r["year"] for r in rows}
         if len(years_used) > 1:
@@ -1011,87 +1210,6 @@ async def compare_geographies(
         "comparison": rows,
         "missing_codes": missing_codes,
         "note": " ".join(notes) if notes else None,
-    }
-
-
-@mcp.tool()
-async def get_data_availability(
-    indicator_code: str,
-    geo_unit_type: str | None = None,
-) -> dict:
-    """Show which countries or regions have data for a UNESCO UIS indicator, and for which years.
-
-    Returns a per-geography summary of data coverage: first year, last year, and number
-    of data points. Useful as a pre-check before calling get_country_ranking or
-    compare_geographies, to understand how much data exists and which years are covered.
-
-    Args:
-        indicator_code: The indicator code (e.g. "LR.AG15T99").
-        geo_unit_type: Optional. "NATIONAL" to show only countries, "REGIONAL" for aggregate
-                       regions only. If omitted, returns both.
-
-    Returns:
-        A dictionary with:
-            - "indicator_code", "indicator_name": Indicator identity.
-            - "geographies": [{code, name, type, first_year, last_year, data_points}, ...].
-            - "summary": {total_geographies, total_records, overall_year_min, overall_year_max}.
-            - "note": Additional context, or null.
-    """
-    try:
-        df = uis.get_data(
-            indicator=indicator_code,
-            geoUnitType=geo_unit_type,
-            labels=True,
-        )
-    except NoDataError:
-        return {
-            "error": f"No data found for indicator '{indicator_code}'"
-                     + (f" with geo_unit_type='{geo_unit_type}'." if geo_unit_type else ".")
-        }
-    except TooManyRecordsError:
-        return {
-            "error": "Too many records returned. Try filtering with geo_unit_type='NATIONAL' or 'REGIONAL'."
-        }
-
-    df = df.dropna(subset=["value"])
-    if df.empty:
-        return {"error": f"No non-null data found for indicator '{indicator_code}'."}
-
-    indicator_name = str(df.iloc[0]["name"])
-
-    grouped = (
-        df.groupby(["geoUnit", "geoUnitName"])
-        .agg(
-            first_year=("year", "min"),
-            last_year=("year", "max"),
-            data_points=("year", "count"),
-        )
-        .reset_index()
-        .sort_values("geoUnitName")
-    )
-
-    geographies = [
-        {
-            "code": str(row["geoUnit"]),
-            "name": str(row["geoUnitName"]),
-            "first_year": int(row["first_year"]),
-            "last_year": int(row["last_year"]),
-            "data_points": int(row["data_points"]),
-        }
-        for _, row in grouped.iterrows()
-    ]
-
-    return {
-        "indicator_code": indicator_code,
-        "indicator_name": indicator_name,
-        "geographies": geographies,
-        "summary": {
-            "total_geographies": len(geographies),
-            "total_records": int(df.shape[0]),
-            "overall_year_min": int(df["year"].min()),
-            "overall_year_max": int(df["year"].max()),
-        },
-        "note": None,
     }
 
 
@@ -1134,9 +1252,27 @@ async def _resolve_geo_unit(ctx: Context, results: list[dict], query: str) -> di
             if elicit_result.action == "accept":
                 chosen_group = elicit_result.data
         except Exception:  # noqa: BLE001
-            pass  # fall through to recommended group
+            # Client doesn't support elicitation — signal callers to surface the
+            # ambiguity themselves rather than silently picking a group.
+            rec = _pick_recommended_group(unique_groups)
+            return {
+                "_disambiguation_required": True,
+                "region_name": region_name,
+                "available_groupings": unique_groups,
+                "ai_recommended_group": rec,
+            }
 
-        if chosen_group is None or chosen_group == _AI_CHOOSE:
+        if chosen_group is None:
+            # User cancelled the elicitation dialog.
+            rec = _pick_recommended_group(unique_groups)
+            return {
+                "_disambiguation_required": True,
+                "region_name": region_name,
+                "available_groupings": unique_groups,
+                "ai_recommended_group": rec,
+            }
+
+        if chosen_group == _AI_CHOOSE:
             chosen_group = _pick_recommended_group(unique_groups)
 
         filtered = [r for r in results if r.get("region_group") == chosen_group]
@@ -1166,18 +1302,23 @@ async def get_latest_value(
 
     IMPORTANT — when to omit geo_unit_code:
     Omit geo_unit_code in ALL cases except when you hold an exact, previously-confirmed
-    code (e.g. a raw ISO3 country code like "KEN", or a code returned by a prior
-    elicitation). Never construct or guess a code yourself (e.g. "SDG: Sub-Saharan Africa").
-    When omitted, the tool interactively elicits the geography, handles name lookup, and
-    disambiguates grouping systems (WB, SDG, UNICEF, etc.) before fetching data.
+    code from a prior tool result (e.g. "KEN" typed directly by the user, or a code
+    returned by search_geo_units after the user confirmed a grouping). NEVER construct or
+    guess a code yourself, even for regions the user named explicitly. When omitted, the
+    tool handles lookup and grouping disambiguation automatically.
+
+    If the tool returns error="geography_disambiguation_required", ask the user which
+    grouping system to use (show available_groupings), then call
+    search_geo_units(query=region_name, region_group=<chosen>) to get the exact code,
+    and retry this tool with geo_unit_code set to that code.
 
     To find indicator codes, use search_indicators. Always show the user the year
     alongside the value, since data is not always available for the most recent years.
 
     Args:
         indicator_code: The indicator code (e.g. "CR.1", "LR.AG15T99").
-        geo_unit_code: Optional. Only pass a code you already hold from a confirmed
-                       source (e.g. "KEN"). Omit to trigger the geography elicitation.
+        geo_unit_code: Optional. Only pass a confirmed code from a prior tool result
+                       (e.g. "KEN"). Omit to trigger geography lookup and disambiguation.
         year: Optional. The specific year to retrieve. If omitted, returns the
               most recent available value. If no data exists for the requested
               year, returns the nearest available year instead, with a note.
@@ -1242,6 +1383,24 @@ async def get_latest_value(
         resolved = await _resolve_geo_unit(ctx, geo_results, search_query)
         if resolved is None:
             return {"error": "Could not resolve geography. Please provide a geo_unit_code directly."}
+        if resolved.get("_disambiguation_required"):
+            groups = resolved["available_groupings"]
+            rec = resolved["ai_recommended_group"]
+            name = resolved["region_name"]
+            return {
+                "error": "geography_disambiguation_required",
+                "region_name": name,
+                "available_groupings": groups,
+                "recommended_grouping": rec,
+                "instruction": (
+                    f"'{name}' exists in multiple regional grouping systems: "
+                    f"{', '.join(groups)}. You MUST ask the user which grouping to use. "
+                    f"Suggest '{rec}' as a sensible default (aligns with UNESCO/SDG reporting). "
+                    f"Once the user chooses, call search_geo_units(query='{name}', "
+                    f"region_group='<chosen>') to get the exact code, then retry this tool "
+                    f"with geo_unit_code set to that code."
+                ),
+            }
 
         geo_unit_code = resolved["code"]
 

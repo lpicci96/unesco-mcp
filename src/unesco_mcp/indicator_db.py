@@ -712,6 +712,27 @@ def write_export_csv(rows: list[dict], label: str = "indicators") -> str:
     return str(file_path)
 
 
+DATA_EXPORT_FIELDNAMES = [
+    "indicator_code", "indicator_name",
+    "geo_unit_code", "geo_unit_name",
+    "year", "value", "qualifier",
+]
+
+
+def write_data_csv(rows: list[dict], label: str = "data") -> str:
+    """Write data export rows to ~/Downloads (falling back to home dir)."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"unesco_{label}_{timestamp}.csv"
+    downloads = Path.home() / "Downloads"
+    out_dir = downloads if downloads.is_dir() else Path.home()
+    file_path = out_dir / filename
+    with open(file_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DATA_EXPORT_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(file_path)
+
+
 # ── Build ──────────────────────────────────────────────────────────────────
 
 

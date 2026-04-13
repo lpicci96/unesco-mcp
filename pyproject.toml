@@ -24,7 +24,13 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = []
+dependencies = [
+    "fastmcp>=3.0.0rc1",
+    "unesco-reader",
+]
+
+[project.scripts]
+unesco-mcp = "unesco_mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/lucapicci/unesco-mcp"
@@ -34,3 +40,6 @@ Changelog = "https://github.com/lucapicci/unesco-mcp/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/unesco_mcp"]
+
+[tool.uv.sources]
+unesco-reader = { git = "https://github.com/lpicci96/unesco_reader" }

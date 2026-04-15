@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from unesco_mcp import indicator_db
+from unesco_mcp import uis_db
 
 
 # ── Minimal mock data matching the structures expected by store_* functions ──
@@ -46,9 +46,9 @@ MOCK_API_INDICATORS = [
 
 @pytest.fixture(autouse=True)
 def tmp_db(tmp_path, monkeypatch):
-    """Redirect indicator_db.DB_PATH to a temp file for every test."""
+    """Redirect uis_db.DB_PATH to a temp file for every test."""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr(indicator_db, "DB_PATH", db_path)
+    monkeypatch.setattr(uis_db, "DB_PATH", db_path)
     yield db_path
 
 
@@ -59,18 +59,18 @@ def mock_uis(monkeypatch):
     Returns a namespace with the mock objects so tests can swap return values.
     """
     mock_indicators = monkeypatch.setattr(
-        "unesco_mcp.indicator_db.uis.available_indicators",
+        "unesco_mcp.uis_db.uis.available_indicators",
         lambda: MOCK_INDICATORS_DF,
     )
     monkeypatch.setattr(
-        "unesco_mcp.indicator_db.uis.available_themes",
+        "unesco_mcp.uis_db.uis.available_themes",
         lambda raw=False: MOCK_THEMES_RAW,
     )
     monkeypatch.setattr(
-        "unesco_mcp.indicator_db.uis.available_geo_units",
+        "unesco_mcp.uis_db.uis.available_geo_units",
         lambda: MOCK_GEO_UNITS_DF,
     )
     monkeypatch.setattr(
-        "unesco_mcp.indicator_db.uis.api.get_indicators",
+        "unesco_mcp.uis_db.uis.api.get_indicators",
         lambda disaggregations=False: MOCK_API_INDICATORS,
     )

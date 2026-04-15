@@ -1,11 +1,11 @@
-"""Tests for indicator_db: DB lifecycle, TTL, and build logic."""
+"""Tests for uis_db: DB lifecycle, TTL, and build logic."""
 
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from unesco_mcp import indicator_db
-from unesco_mcp.indicator_db import (
+from unesco_mcp import uis_db
+from unesco_mcp.uis_db import (
     build_db,
     init_db,
     is_db_fresh,
@@ -20,13 +20,13 @@ from unesco_mcp.indicator_db import (
 
 class TestTeardownDb:
     def test_removes_existing_db(self):
-        indicator_db.DB_PATH.touch()
-        assert indicator_db.DB_PATH.exists()
+        uis_db.DB_PATH.touch()
+        assert uis_db.DB_PATH.exists()
         teardown_db()
-        assert not indicator_db.DB_PATH.exists()
+        assert not uis_db.DB_PATH.exists()
 
     def test_no_error_when_missing(self):
-        assert not indicator_db.DB_PATH.exists()
+        assert not uis_db.DB_PATH.exists()
         teardown_db()  # should not raise
 
 
@@ -70,7 +70,7 @@ class TestInitDb:
 
 class TestIsDbFresh:
     def test_false_when_no_db_file(self):
-        assert not indicator_db.DB_PATH.exists()
+        assert not uis_db.DB_PATH.exists()
         assert is_db_fresh() is False
 
     def test_false_when_no_built_at(self):
@@ -108,7 +108,7 @@ class TestIsDbFresh:
         assert is_db_fresh() is True
 
     def test_false_on_corrupted_db(self):
-        indicator_db.DB_PATH.write_bytes(b"not a sqlite database")
+        uis_db.DB_PATH.write_bytes(b"not a sqlite database")
         assert is_db_fresh() is False
 
 
@@ -117,10 +117,10 @@ class TestIsDbFresh:
 
 class TestBuildDb:
     def test_full_build_from_scratch(self, mock_uis):
-        assert not indicator_db.DB_PATH.exists()
+        assert not uis_db.DB_PATH.exists()
         build_db()
 
-        assert indicator_db.DB_PATH.exists()
+        assert uis_db.DB_PATH.exists()
 
         # Tables are populated
         indicators = query("SELECT * FROM indicators")
@@ -144,7 +144,7 @@ class TestBuildDb:
         build_db()
 
         spy = mocker.patch(
-            "unesco_mcp.indicator_db.store_indicators", wraps=None
+            "unesco_mcp.uis_db.store_indicators", wraps=None
         )
         build_db()  # TTL is fresh, should skip
         spy.assert_not_called()
@@ -161,15 +161,15 @@ class TestBuildDb:
             )
 
         spy = mocker.patch(
-            "unesco_mcp.indicator_db.store_indicators",
+            "unesco_mcp.uis_db.store_indicators",
             wraps=None,
         )
-        mocker.patch("unesco_mcp.indicator_db.store_themes")
-        mocker.patch("unesco_mcp.indicator_db.store_geo_units")
-        mocker.patch("unesco_mcp.indicator_db.get_disaggregations", return_value={})
-        mocker.patch("unesco_mcp.indicator_db.store_disaggregation_types")
-        mocker.patch("unesco_mcp.indicator_db.store_disaggregation_values")
-        mocker.patch("unesco_mcp.indicator_db.store_indicator_disaggregations")
+        mocker.patch("unesco_mcp.uis_db.store_themes")
+        mocker.patch("unesco_mcp.uis_db.store_geo_units")
+        mocker.patch("unesco_mcp.uis_db.get_disaggregations", return_value={})
+        mocker.patch("unesco_mcp.uis_db.store_disaggregation_types")
+        mocker.patch("unesco_mcp.uis_db.store_disaggregation_values")
+        mocker.patch("unesco_mcp.uis_db.store_indicator_disaggregations")
 
         build_db()
         spy.assert_called_once()
@@ -178,15 +178,15 @@ class TestBuildDb:
         build_db()
 
         spy = mocker.patch(
-            "unesco_mcp.indicator_db.store_indicators",
+            "unesco_mcp.uis_db.store_indicators",
             wraps=None,
         )
-        mocker.patch("unesco_mcp.indicator_db.store_themes")
-        mocker.patch("unesco_mcp.indicator_db.store_geo_units")
-        mocker.patch("unesco_mcp.indicator_db.get_disaggregations", return_value={})
-        mocker.patch("unesco_mcp.indicator_db.store_disaggregation_types")
-        mocker.patch("unesco_mcp.indicator_db.store_disaggregation_values")
-        mocker.patch("unesco_mcp.indicator_db.store_indicator_disaggregations")
+        mocker.patch("unesco_mcp.uis_db.store_themes")
+        mocker.patch("unesco_mcp.uis_db.store_geo_units")
+        mocker.patch("unesco_mcp.uis_db.get_disaggregations", return_value={})
+        mocker.patch("unesco_mcp.uis_db.store_disaggregation_types")
+        mocker.patch("unesco_mcp.uis_db.store_disaggregation_values")
+        mocker.patch("unesco_mcp.uis_db.store_indicator_disaggregations")
 
         build_db(fresh=True)  # should rebuild even though TTL is fresh
         spy.assert_called_once()
@@ -210,14 +210,14 @@ class TestBuildDb:
             },
         ])
         monkeypatch.setattr(
-            "unesco_mcp.indicator_db.uis.available_indicators", lambda: new_df
+            "unesco_mcp.uis_db.uis.available_indicators", lambda: new_df
         )
         monkeypatch.setattr(
-            "unesco_mcp.indicator_db.uis.available_themes",
+            "unesco_mcp.uis_db.uis.available_themes",
             lambda raw=False: [{"theme": "SCIENCE", "lastUpdate": "2025-06-01", "lastUpdateDescription": "New"}],
         )
         monkeypatch.setattr(
-            "unesco_mcp.indicator_db.uis.api.get_indicators",
+            "unesco_mcp.uis_db.uis.api.get_indicators",
             lambda disaggregations=False: [
                 {
                     "indicatorCode": "NEW.1",

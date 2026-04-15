@@ -7,24 +7,13 @@ import unesco_reader as uis
 from unesco_reader.exceptions import NoDataError, TooManyRecordsError
 
 from unesco_mcp.config import MAX_RESULTS, MAX_RESULTS_CAP, MAX_SUMMARY_CODES
-from unesco_mcp.indicator_db import (
-    build_db,
-    query as db_query,
-    search_indicators as db_search_indicators,
-    count_indicators as db_count_indicators,
-    get_themes as db_get_themes,
-    get_indicator_summaries as db_get_indicator_summaries,
-    get_export_rows as db_get_export_rows,
-    search_geo_units as db_search_geo_units,
-    write_export_csv,
-    write_data_csv,
-)
+from unesco_mcp import uis_db
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     """Build the indicator DB on startup if stale, keep it across restarts."""
-    build_db()
+    uis_db.build_db()
     yield
 
 
@@ -153,7 +142,7 @@ async def list_themes() -> dict:
             - "hint": A string providing guidance on how to use the theme codes for searching indicators
     """
 
-    themes = db_get_themes()
+    themes = uis_db.get_themes()
 
     return {
         "theme information": themes,
@@ -176,7 +165,7 @@ async def list_disaggregation_types() -> dict:
             - "hint": Guidance on how to use the type codes.
     """
 
-    rows = db_query("SELECT type_code, type_name FROM disaggregation_types ORDER BY type_name")
+    rows = uis_db.query("SELECT type_code, type_name FROM disaggregation_types ORDER BY type_name")
 
     return {
         "disaggregation_types": rows,
@@ -204,7 +193,7 @@ async def get_disaggregation_values(type_code: str) -> dict:
     """
 
     # Verify the type exists
-    type_rows = db_query(
+    type_rows = uis_db.query(
         "SELECT type_code, type_name FROM disaggregation_types WHERE type_code = ?",
         (type_code,),
     )
@@ -214,7 +203,7 @@ async def get_disaggregation_values(type_code: str) -> dict:
 
     type_info = type_rows[0]
 
-    values = db_query(
+    values = uis_db.query(
         """
         SELECT dv.code, dv.name, dv.description
         FROM disaggregation_values dv
@@ -282,7 +271,7 @@ async def search_indicators(
 
     effective_limit = min(max(limit, 1), MAX_RESULTS_CAP)
 
-    results, total = db_search_indicators(
+    results, total = uis_db.search_indicators(
         query_term=query,
         theme=theme,
         disaggregation_types=disaggregation_types,
@@ -340,7 +329,7 @@ async def count_indicators(
             - "count": The exact number of indicators matching all provided filters.
             - "filters_applied": A summary of which filters were used.
     """
-    count = db_count_indicators(
+    count = uis_db.count_indicators(
         theme=theme,
         disaggregation_types=disaggregation_types,
         disaggregation_values=disaggregation_values,
@@ -472,7 +461,7 @@ async def get_indicator_summary(indicator_codes: list[str]) -> dict:
     if len(indicator_codes) > MAX_SUMMARY_CODES:
         return {"error": f"Maximum {MAX_SUMMARY_CODES} indicator codes allowed per request."}
 
-    summaries = db_get_indicator_summaries(indicator_codes)
+    summaries = uis_db.get_indicator_summaries(indicator_codes)
     found_codes = {s["code"] for s in summaries}
     not_found = [c for c in indicator_codes if c not in found_codes]
 
@@ -514,14 +503,14 @@ async def export_indicators(
     if not any([query, theme, disaggregation_types, disaggregation_values]):
         return {"error": "At least one filter parameter must be provided."}
 
-    rows = db_get_export_rows(
+    rows = uis_db.get_export_rows(
         query_term=query,
         theme=theme,
         disaggregation_types=disaggregation_types,
         disaggregation_values=disaggregation_values,
     )
 
-    file_path = write_export_csv(rows)
+    file_path = uis_db.write_export_csv(rows)
     return {
         "saved_to": file_path,
         "row_count": len(rows),
@@ -626,7 +615,7 @@ async def export_data(
         for _, row in df.iterrows()
     ]
 
-    file_path = write_data_csv(rows)
+    file_path = uis_db.write_data_csv(rows)
     return {
         "saved_to": file_path,
         "row_count": len(rows),
@@ -674,7 +663,7 @@ async def search_geo_units(
             - "count": Number of results returned.
             - "hint": Guidance on next steps.
     """
-    results = db_search_geo_units(
+    results = uis_db.search_geo_units(
         query_term=query,
         type_filter=type_filter,
         region_group=region_group,
@@ -859,7 +848,7 @@ async def get_time_series(
 
             search_query = name_result.data.strip()
 
-        geo_results = db_search_geo_units(query_term=search_query)
+        geo_results = uis_db.search_geo_units(query_term=search_query)
         if not geo_results:
             return {
                 "error": f"No geographic unit found matching '{search_query}'. "
@@ -1367,7 +1356,7 @@ async def get_latest_value(
             search_query = name_result.data.strip()
 
         # Step 3 — look up the geography, resolving grouping ambiguity via elicitation.
-        geo_results = db_search_geo_units(query_term=search_query)
+        geo_results = uis_db.search_geo_units(query_term=search_query)
         if not geo_results:
             return {
                 "error": f"No geographic unit found matching '{search_query}'. "

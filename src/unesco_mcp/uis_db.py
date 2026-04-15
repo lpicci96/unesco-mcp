@@ -1,6 +1,5 @@
 """SQLite database for caching UNESCO UIS indicators and disaggregation metadata."""
 
-import csv
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -636,112 +635,6 @@ def count_indicators(
     sql = f"SELECT COUNT(*) as cnt FROM indicators i {where}"
     rows = query(sql, tuple(params))
     return rows[0]["cnt"] if rows else 0
-
-
-EXPORT_FIELDNAMES = [
-    "code", "name", "theme", "timeLine_min", "timeLine_max",
-    "totalRecordCount", "lastDataUpdate", "disaggregation_types",
-]
-
-
-def get_export_rows(
-    query_term: str | None = None,
-    theme: str | None = None,
-    disaggregation_types: list[str] | None = None,
-    disaggregation_values: list[str] | None = None,
-) -> list[dict]:
-    """Fetch all matching indicators with disaggregation_types merged in.
-
-    Uses the same filter logic as search_indicators but with no result limit.
-    Each row has disaggregation_types as a semicolon-separated string.
-    """
-    conditions, params = _build_indicator_conditions(
-        theme=theme,
-        disaggregation_types=disaggregation_types,
-        disaggregation_values=disaggregation_values,
-    )
-    joins: list[str] = []
-
-    if query_term is not None:
-        joins.append("JOIN indicators_fts fts ON fts.code = i.code")
-        conditions.append("indicators_fts MATCH ?")
-        params.append(query_term)
-
-    join_clause = " ".join(joins)
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
-    indicators = query(
-        f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max, "
-        f"i.totalRecordCount, i.lastDataUpdate "
-        f"FROM indicators i {join_clause} {where}",
-        tuple(params),
-    )
-
-    if not indicators:
-        return []
-
-    # Attach disaggregation type names
-    codes = [ind["code"] for ind in indicators]
-    placeholders = ", ".join("?" for _ in codes)
-    disagg_rows = query(
-        f"SELECT id_map.indicator_code, dt.type_name "
-        f"FROM indicator_disaggregations id_map "
-        f"JOIN disaggregation_values dv ON dv.id = id_map.disaggregation_id "
-        f"JOIN disaggregation_types dt ON dt.id = dv.type_id "
-        f"WHERE id_map.indicator_code IN ({placeholders}) "
-        f"GROUP BY id_map.indicator_code, dt.type_name",
-        tuple(codes),
-    )
-    disagg_by_code: dict[str, list[str]] = {}
-    for row in disagg_rows:
-        disagg_by_code.setdefault(row["indicator_code"], []).append(row["type_name"])
-
-    for ind in indicators:
-        ind["disaggregation_types"] = "; ".join(disagg_by_code.get(ind["code"], []))
-
-    return indicators
-
-
-def write_export_csv(rows: list[dict], label: str = "indicators") -> str:
-    """Write export rows to ~/Downloads (falling back to home dir).
-
-    Uses a timestamped filename so repeated exports don't overwrite each other.
-    Returns the absolute file path.
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"unesco_{label}_{timestamp}.csv"
-
-    downloads = Path.home() / "Downloads"
-    out_dir = downloads if downloads.is_dir() else Path.home()
-    file_path = out_dir / filename
-
-    with open(file_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    return str(file_path)
-
-
-DATA_EXPORT_FIELDNAMES = [
-    "indicator_code", "indicator_name",
-    "geo_unit_code", "geo_unit_name",
-    "year", "value", "qualifier",
-]
-
-
-def write_data_csv(rows: list[dict], label: str = "data") -> str:
-    """Write data export rows to ~/Downloads (falling back to home dir)."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"unesco_{label}_{timestamp}.csv"
-    downloads = Path.home() / "Downloads"
-    out_dir = downloads if downloads.is_dir() else Path.home()
-    file_path = out_dir / filename
-    with open(file_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=DATA_EXPORT_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
-    return str(file_path)
 
 
 # ── Build ──────────────────────────────────────────────────────────────────

@@ -97,23 +97,15 @@ Example: "Show me primary education completion indicators by sex"
    - Compare a specific set of countries or regions → compare_geographies
      (pass pre-confirmed geo_unit_codes; supports up to 20 codes; ranks by value)
 
-8. CSV EXPORTS — choose the right export tool:
-   - export_indicators: Exports the indicator *catalog* (names, codes, themes, coverage).
-     Use when the user wants to save or download a list of indicators. At least one filter
-     required. After calling, ALWAYS tell the user: "Saved {row_count} indicators to: {saved_to}"
-   - export_data: Exports actual *numeric data values* (time series) to CSV.
-     TWO PATTERNS:
-     (a) ALL INDICATORS FOR A GEOGRAPHY: omit indicator_codes, provide geo_unit_codes or
-         geo_unit_type. E.g. export_data(geo_unit_codes=["KEN"]) fetches every indicator
-         for Kenya. This will NOT hit API limits.
-     (b) SPECIFIC INDICATORS: provide indicator_codes (from search_indicators), optionally
-         scoped to a geography. To find the right codes, use search_indicators FIRST —
-         prioritise structured filters (theme, disaggregation_types, disaggregation_values)
-         over the text query parameter, as they are far more reliable for topic discovery.
-     At least one of indicator_codes or a geography filter is required.
-     After calling, ALWAYS tell the user: "Saved {row_count} data rows to: {saved_to}"
-   Trigger words for either: "save", "download", "export", "give me all", "full list", "complete
-   list". Choose based on whether the user wants indicator metadata or actual data values.
+8. BULK DATA REQUESTS: This server does NOT support bulk data downloads or CSV exports.
+   When a user asks to "get all data", "download", "export", or "give me everything" for
+   an indicator or topic, do NOT attempt to fetch all records. Instead:
+   - For a cross-country snapshot → use get_country_ranking (returns top/bottom N countries)
+   - For trends in specific countries → use get_time_series (one indicator, one geography)
+   - For comparing specific countries → use compare_geographies (up to 20 geo units)
+   Explain that these tools provide focused, useful slices of the data. For bulk data needs
+   (e.g. full datasets for research or analysis), suggest the user visit the UIS data portal
+   at https://data.uis.unesco.org or use the unesco-reader Python package directly.
 
 Example: "How many education indicators have data from 2010 to 2020?"
   → list_themes → find education theme code
@@ -240,10 +232,8 @@ async def search_indicators(
     """Search UNESCO UIS indicators by relevance using text and structured filters.
 
     Use this tool to discover which indicators exist for a topic. Results are capped
-    (default 20, max 50) and intended for interactive exploration only — do NOT use
-    this to save, download, or give the user a full list of indicators. For that,
-    use export_indicators instead. For counting indicators with precise year or date
-    filters, use count_indicators.
+    (default 20, max 50) and intended for interactive exploration. For counting
+    indicators with precise year or date filters, use count_indicators.
 
     IMPORTANT - SUGGESTED WORKFLOW:
     1. Call list_themes if the user mentions a thematic area (e.g. "education", "culture") to find the exact theme code.
@@ -481,157 +471,6 @@ async def get_indicator_summary(indicator_codes: list[str]) -> dict:
         "indicators": summaries,
         "returned": len(summaries),
         "not_found": not_found,
-    }
-
-
-@mcp.tool()
-async def export_indicators(
-    query: str | None = None,
-    theme: str | None = None,
-    disaggregation_types: list[str] | None = None,
-    disaggregation_values: list[str] | None = None,
-) -> dict:
-    """Export matching UNESCO UIS indicators to a CSV file.
-
-    Use this tool whenever the user wants to save, download, export, or get a full
-    list of indicators — even if they just say "give me all education indicators" or
-    "save the results". Unlike search_indicators (which caps results at 50), this
-    fetches every match with no limit and writes a CSV file to ~/Downloads/.
-
-    At least one filter must be provided.
-
-    After calling this tool, ALWAYS tell the user exactly:
-    "Saved {row_count} indicators to: {saved_to}"
-
-    Args:
-        query: Full-text search on indicator name (FTS5 with stemming).
-        theme: Exact theme code (from list_themes).
-        disaggregation_types: List of disaggregation type codes. Indicators must support ALL listed types.
-        disaggregation_values: List of disaggregation value codes. Indicators must match ALL listed values.
-
-    Returns:
-        {"saved_to": "/absolute/path/to/file.csv", "row_count": N}
-    """
-    if not any([query, theme, disaggregation_types, disaggregation_values]):
-        return {"error": "At least one filter parameter must be provided."}
-
-    uis_db.ensure_fresh()
-    rows = uis_db.get_export_rows(
-        query_term=query,
-        theme=theme,
-        disaggregation_types=disaggregation_types,
-        disaggregation_values=disaggregation_values,
-    )
-
-    file_path = uis_db.write_export_csv(rows)
-    return {
-        "saved_to": file_path,
-        "row_count": len(rows),
-    }
-
-
-@mcp.tool()
-async def export_data(
-    indicator_codes: list[str] | None = None,
-    geo_unit_codes: list[str] | None = None,
-    geo_unit_type: str | None = None,
-    start_year: int | None = None,
-    end_year: int | None = None,
-) -> dict:
-    """Export actual numeric data values for UNESCO UIS indicators to a CSV file.
-
-    Use this tool when the user wants to download or save the data itself (time series
-    values by year and geography) — not the indicator catalog. For exporting the indicator
-    catalog (names, codes, themes), use export_indicators instead.
-
-    TWO USAGE PATTERNS:
-
-    1. ALL INDICATORS FOR A GEOGRAPHY — omit indicator_codes, provide geography:
-       export_data(geo_unit_codes=["KEN"])  →  all indicators for Kenya
-       export_data(geo_unit_type="NATIONAL")  →  all indicators for all countries
-       This does NOT hit API limits; the API returns one geography's full dataset.
-
-    2. SPECIFIC INDICATORS ACROSS GEOGRAPHIES — provide indicator_codes, omit or specify geography:
-       export_data(indicator_codes=["LR.1", "LR.2"])  →  those indicators for all geographies
-       export_data(indicator_codes=["LR.1"], geo_unit_type="NATIONAL")  →  national only
-       To find indicator codes for a topic, call search_indicators FIRST using structured
-       filters (theme, disaggregation_types, disaggregation_values) — these are far more
-       reliable than the text query. Only use query as a secondary refinement. Then pass the
-       returned codes here.
-
-    At least one of indicator_codes or a geography filter must be provided.
-    geo_unit_codes and geo_unit_type are mutually exclusive (max 20 geo_unit_codes).
-
-    After calling this tool, ALWAYS tell the user:
-    "Saved {row_count} data rows to: {saved_to}"
-
-    Args:
-        indicator_codes: Optional list of indicator codes. Omit to fetch all indicators for
-                         the given geography. Use search_indicators to find codes first.
-        geo_unit_codes: Optional list of specific geo unit codes (max 20).
-                        Mutually exclusive with geo_unit_type.
-        geo_unit_type: Optional. "NATIONAL" for all countries, "REGIONAL" for all regions.
-                       Mutually exclusive with geo_unit_codes.
-        start_year: Optional. First year to include (inclusive).
-        end_year: Optional. Last year to include (inclusive).
-
-    Returns:
-        {"saved_to": "/absolute/path/to/file.csv", "row_count": N}
-    """
-    has_indicators = bool(indicator_codes)
-    has_geography = bool(geo_unit_codes) or geo_unit_type is not None
-    if not has_indicators and not has_geography:
-        return {"error": "At least one of indicator_codes or a geography filter (geo_unit_codes or geo_unit_type) must be provided. Fetching all UNESCO data at once is not supported."}
-
-    if geo_unit_codes and geo_unit_type:
-        return {"error": "geo_unit_codes and geo_unit_type are mutually exclusive. Provide one or the other, not both."}
-
-    if geo_unit_codes and len(geo_unit_codes) > 20:
-        return {"error": f"geo_unit_codes is capped at 20 entries. {len(geo_unit_codes)} were provided. Use geo_unit_type='NATIONAL' to fetch all countries instead."}
-
-    try:
-        df = uis.get_data(
-            indicator=indicator_codes,
-            geoUnit=geo_unit_codes,
-            geoUnitType=geo_unit_type,
-            start=start_year,
-            end=end_year,
-            labels=True,
-        )
-    except NoDataError:
-        return {
-            "error": (
-                "No data found for the given filters. "
-                "Check that the indicator codes and geography codes are valid and that data "
-                "exists for the specified combination and year range."
-            )
-        }
-    except TooManyRecordsError:
-        return {
-            "error": (
-                "Too many records returned by the API. Narrow the request by passing "
-                "fewer indicator_codes, using geo_unit_type instead of no geography filter, "
-                "passing fewer geo_unit_codes, or adding a tighter year range."
-            )
-        }
-
-    rows = [
-        {
-            "indicator_code": str(row["indicatorId"]),
-            "indicator_name": str(row["name"]),
-            "geo_unit_code": str(row["geoUnit"]),
-            "geo_unit_name": str(row["geoUnitName"]),
-            "year": int(row["year"]),
-            "value": round(float(row["value"]), 6) if str(row.get("value", "nan")) != "nan" else None,
-            "qualifier": _safe_qualifier(row),
-        }
-        for _, row in df.iterrows()
-    ]
-
-    file_path = uis_db.write_data_csv(rows)
-    return {
-        "saved_to": file_path,
-        "row_count": len(rows),
     }
 
 

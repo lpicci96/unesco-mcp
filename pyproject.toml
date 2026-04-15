@@ -39,7 +39,7 @@ Issues = "https://github.com/lucapicci/unesco-mcp/issues"
 Changelog = "https://github.com/lucapicci/unesco-mcp/blob/main/CHANGELOG.md"
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-mock>=3.14", "pytest-asyncio>=0.25"]
+dev = ["pytest>=8.0", "pytest-mock>=3.14", "pytest-asyncio>=0.25", "pytest-cov>=6.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

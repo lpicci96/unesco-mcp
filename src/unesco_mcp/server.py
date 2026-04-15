@@ -1015,7 +1015,8 @@ async def get_country_ranking(
         return {"error": f"No non-null data found for indicator '{indicator_code}'."}
 
     if year is None:
-        year_used = int(df["year"].mode()[0])
+        year_counts = df["year"].value_counts()
+        year_used = int(year_counts.index[0])
         note = f"No year specified — using {year_used} (year with most country coverage)."
     else:
         year_used = year

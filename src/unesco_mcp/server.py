@@ -70,23 +70,19 @@ Example: "Show me primary education completion indicators by sex"
    than get_indicator_metadata. Reserve get_indicator_metadata for when the user needs full
    definitions, methodology, or detailed disaggregation breakdowns for a single indicator.
 
-6. GEOGRAPHY RESOLUTION — single clear rule for get_latest_value AND get_time_series:
-   - OMIT geo_unit_code (do not pass it) in ALL cases EXCEPT when you already hold an
-     exact, previously-confirmed code from a prior tool result (e.g. a code returned by
-     search_geo_units after the user confirmed a grouping, or a raw ISO3 code the user
-     typed directly like "KEN" or "ZWE"). When geo_unit_code is omitted the tool handles
-     geography lookup and grouping disambiguation automatically.
-   - NEVER guess, construct, or look up a geo_unit_code yourself — not even for regions
-     the user named explicitly (e.g. "Sub-Saharan Africa", "East Asia"). Always omit
-     geo_unit_code and let the tool do the lookup. Regional names map to multiple codes
-     depending on grouping system (WB, SDG, UNICEF, etc.), and the tool must ask the
-     user to choose. If you construct a code you will silently pick the wrong grouping.
-   - If the tool returns "geography_disambiguation_required": ask the user which
-     grouping system to use (present the available_groupings list), then call
-     search_geo_units(query=region_name, region_group=<chosen>) to get the exact code,
-     then retry the tool with that geo_unit_code.
-   - NEVER call search_geo_units as a pre-step before get_latest_value or get_time_series
-     unless the user explicitly asks to explore or list geographies.
+6. GEOGRAPHY RESOLUTION for get_latest_value, get_time_series, and compare_geographies:
+   - For COUNTRIES (e.g. "Kenya", "France"): you may pass the ISO3 code directly as
+     geo_unit_code if you are certain of it (e.g. "KEN", "FRA").
+   - For REGIONS (e.g. "Africa", "Sub-Saharan Africa", "East Asia", "Latin America"):
+     ALWAYS call search_geo_units first. Regional names exist in multiple grouping
+     systems (WB, SDG, UNICEF, etc.) with different country compositions — each
+     grouping defines different boundaries and includes different countries, so using
+     the wrong one returns silently incorrect data. search_geo_units will ask the user
+     which grouping they want. Only pass a regional geo_unit_code that came from a
+     search_geo_units result in this conversation.
+   - If unsure whether a geography is a country or a region, call search_geo_units.
+   - NEVER construct or guess a regional code yourself. Even if you know a code like
+     "SSA_DSR", you cannot know which grouping system the user intends.
 
 7. DATA RETRIEVAL — choose the right tool:
    - Single data point (latest or specific year) → get_latest_value
@@ -474,21 +470,6 @@ async def get_indicator_summary(indicator_codes: list[str]) -> dict:
     }
 
 
-_AI_CHOOSE = "Let AI choose the most appropriate"
-
-# Priority order for AI-recommended grouping when the user defers the choice.
-# SDG and UIS align most closely with UNESCO's reporting frameworks; WB and ECA
-# are broader economic groupings; GPE is education-finance-specific.
-_GROUP_PRIORITY = ["SDG", "UIS", "UNICEF", "MDG", "UN", "WB", "ECA", "GPE"]
-
-
-def _pick_recommended_group(available: list[str]) -> str:
-    """Return the highest-priority group present in *available*."""
-    for g in _GROUP_PRIORITY:
-        if g in available:
-            return g
-    return available[0]
-
 
 @mcp.tool()
 async def search_geo_units(
@@ -533,77 +514,54 @@ async def search_geo_units(
             unique_groups.append(g)
 
     if len(unique_groups) > 1:
-        # Try to elicit a grouping choice from the user.
-        choices = unique_groups + [_AI_CHOOSE]
-        # Identify the single region name for the prompt (use the first regional result's name).
         region_name = regional[0]["name"] if regional else query
+
+        # Try to elicit a grouping choice from the user.
+        chosen = None
         try:
             elicit_result = await ctx.elicit(
                 f"'{region_name}' exists in multiple regional grouping systems: "
                 f"{', '.join(unique_groups)}.\n"
-                f"Which grouping would you like to use? "
-                f"If unsure, choose '{_AI_CHOOSE}'.",
-                response_type=choices,
+                f"Which grouping would you like to use?",
+                response_type=unique_groups,
             )
-        except Exception as exc:  # noqa: BLE001 — elicitation failure is non-fatal
-            # Client does not support MCP elicitation (or it failed) — fall back to text.
-            rec = _pick_recommended_group(unique_groups)
+            if elicit_result is not None and elicit_result.action == "accept":
+                chosen = elicit_result.data
+        except Exception:  # noqa: BLE001 — elicitation failure is non-fatal
+            pass
+
+        if chosen is not None:
+            # User chose a grouping — filter and return only that grouping's results.
+            filtered = [r for r in results if r.get("region_group") == chosen or r["type"] == "NATIONAL"]
             return {
-                "geo_units": results,
-                "count": len(results),
-                "requires_user_choice": True,
-                "available_groupings": unique_groups,
-                "ai_recommended_group": rec,
-                "elicitation_error": f"{type(exc).__name__}: {exc}",
+                "geo_units": filtered,
+                "count": len(filtered),
                 "hint": (
-                    f"Elicitation failed ({type(exc).__name__}: {exc}). "
-                    f"IMPORTANT: Before calling get_latest_value, you MUST ask the user "
-                    f"which grouping system to use: {', '.join(unique_groups)}. "
-                    f"If the user is unsure, suggest '{rec}' as it aligns best with "
-                    f"UNESCO's reporting frameworks. Do NOT proceed without confirming."
+                    f"Filtered to '{chosen}' grouping. "
+                    f"Use the 'code' field as geo_unit_code in data retrieval tools."
                 ),
             }
 
-        if elicit_result is not None and elicit_result.action == "accept":
-            chosen = elicit_result.data
-            if chosen == _AI_CHOOSE:
-                # Return all results but flag the recommended grouping.
-                rec = _pick_recommended_group(unique_groups)
-                return {
-                    "geo_units": results,
-                    "count": len(results),
-                    "ai_recommended_group": rec,
-                    "hint": (
-                        f"Use the 'code' field as geo_unit_code in get_latest_value. "
-                        f"The AI-recommended grouping is '{rec}' as it aligns best with "
-                        f"UNESCO's reporting frameworks."
-                    ),
-                }
-            else:
-                # Filter to the chosen grouping only.
-                filtered = [r for r in results if r.get("region_group") == chosen or r["type"] == "NATIONAL"]
-                return {
-                    "geo_units": filtered,
-                    "count": len(filtered),
-                    "hint": (
-                        f"Filtered to '{chosen}' grouping. "
-                        f"Use the 'code' field as geo_unit_code in get_latest_value."
-                    ),
-                }
-        # User declined/cancelled — return everything and prompt manual choice.
-
-    hint = "Use the 'code' field as the geo_unit_code in get_latest_value."
-    if len(unique_groups) > 1:
-        rec = _pick_recommended_group(unique_groups)
-        hint += (
-            f" Multiple regional grouping systems found ({', '.join(unique_groups)}). "
-            f"Ask the user which grouping to use, or suggest '{rec}' for UNESCO education data."
-        )
+        # Elicitation failed, was declined, or was cancelled.
+        # Do NOT return geo unit data — force Claude to ask the user.
+        return {
+            "error": "geography_disambiguation_required",
+            "region_name": region_name,
+            "available_groupings": unique_groups,
+            "instruction": (
+                f"'{region_name}' exists in multiple regional grouping systems: "
+                f"{', '.join(unique_groups)}. Each grouping defines different boundaries "
+                f"and includes different countries. You MUST ask the user which grouping "
+                f"to use. Present the options and let them choose. Once they choose, call "
+                f"search_geo_units(query='{region_name}', region_group='<chosen>') to get "
+                f"the correct code."
+            ),
+        }
 
     return {
         "geo_units": results,
         "count": len(results),
-        "hint": hint,
+        "hint": "Use the 'code' field as the geo_unit_code in data retrieval tools.",
     }
 
 def _rows_to_ranking(subset) -> list[dict]:
@@ -640,21 +598,17 @@ async def get_time_series(
     Returns all data points for the indicator × geography combination, optionally
     filtered to a year range. Ideal for trend analysis and time-series visualisation.
 
-    IMPORTANT — when to omit geo_unit_code:
-    Omit geo_unit_code in ALL cases except when you hold an exact, previously-confirmed
-    code from a prior tool result. NEVER construct or guess a code yourself — regional
-    names (e.g. "Sub-Saharan Africa") map to multiple codes across grouping systems
-    (WB, SDG, UNICEF, etc.) and the wrong one gives wrong data. When omitted, the tool
-    handles geography lookup and grouping disambiguation automatically.
-
-    If the tool returns error="geography_disambiguation_required", ask the user which
-    grouping system to use, then call search_geo_units(query=region_name,
-    region_group=<chosen>) to get the exact code, and retry with that geo_unit_code.
+    GEOGRAPHY RULES:
+    - For countries: pass the ISO3 code directly (e.g. "KEN", "FRA").
+    - For regions: ALWAYS call search_geo_units first — it will ask the user which
+      grouping system to use. Regional names map to multiple codes with different
+      country compositions; using the wrong one gives silently wrong data.
+    - If omitted, the tool will interactively ask the user for the geography.
 
     Args:
         indicator_code: The indicator code (e.g. "LR.AG15T99").
-        geo_unit_code: Optional. Only pass a confirmed code from a prior tool result.
-                       Omit to trigger geography lookup and disambiguation.
+        geo_unit_code: ISO3 code for countries, or a confirmed code from search_geo_units
+                       for regions. Omit to trigger interactive geography lookup.
         start_year: Optional. First year to include (inclusive).
         end_year: Optional. Last year to include (inclusive).
 
@@ -713,20 +667,18 @@ async def get_time_series(
             return {"error": "Could not resolve geography. Please provide a geo_unit_code directly."}
         if resolved.get("_disambiguation_required"):
             groups = resolved["available_groupings"]
-            rec = resolved["ai_recommended_group"]
             name = resolved["region_name"]
             return {
                 "error": "geography_disambiguation_required",
                 "region_name": name,
                 "available_groupings": groups,
-                "recommended_grouping": rec,
                 "instruction": (
                     f"'{name}' exists in multiple regional grouping systems: "
-                    f"{', '.join(groups)}. You MUST ask the user which grouping to use. "
-                    f"Suggest '{rec}' as a sensible default (aligns with UNESCO/SDG reporting). "
-                    f"Once the user chooses, call search_geo_units(query='{name}', "
-                    f"region_group='<chosen>') to get the exact code, then retry this tool "
-                    f"with geo_unit_code set to that code."
+                    f"{', '.join(groups)}. Each defines different boundaries and includes "
+                    f"different countries. Ask the user which grouping to use. Present all "
+                    f"options and let them choose. Once they choose, call "
+                    f"search_geo_units(query='{name}', region_group='<chosen>') to get "
+                    f"the exact code, then retry this tool with that geo_unit_code."
                 ),
             }
 
@@ -1055,7 +1007,7 @@ async def _resolve_geo_unit(ctx: Context, results: list[dict], query: str) -> di
 
     When multiple grouping systems are present (e.g. WB, SDG, UNICEF for the same
     region name), elicits a choice from the user. On elicitation failure or cancel,
-    falls back to the highest-priority recommended group.
+    returns a disambiguation dict so the caller can surface the choice to the user.
 
     Returns the resolved geo unit dict, or None if there are no results.
     """
@@ -1075,49 +1027,36 @@ async def _resolve_geo_unit(ctx: Context, results: list[dict], query: str) -> di
             seen.add(g)
             unique_groups.append(g)
 
-    chosen_group: str | None = None
-
     if len(unique_groups) > 1:
         region_name = regional[0]["name"] if regional else query
+
+        # Try to elicit a grouping choice from the user.
+        chosen_group = None
         try:
             elicit_result = await ctx.elicit(
                 f"'{region_name}' exists in multiple regional grouping systems: "
                 f"{', '.join(unique_groups)}.\n"
-                f"Which grouping would you like to use? "
-                f"If unsure, choose '{_AI_CHOOSE}'.",
-                response_type=unique_groups + [_AI_CHOOSE],
+                f"Which grouping would you like to use?",
+                response_type=unique_groups,
             )
             if elicit_result.action == "accept":
                 chosen_group = elicit_result.data
         except Exception:  # noqa: BLE001
-            # Client doesn't support elicitation — signal callers to surface the
-            # ambiguity themselves rather than silently picking a group.
-            rec = _pick_recommended_group(unique_groups)
-            return {
-                "_disambiguation_required": True,
-                "region_name": region_name,
-                "available_groupings": unique_groups,
-                "ai_recommended_group": rec,
-            }
+            pass
 
-        if chosen_group is None:
-            # User cancelled the elicitation dialog.
-            rec = _pick_recommended_group(unique_groups)
-            return {
-                "_disambiguation_required": True,
-                "region_name": region_name,
-                "available_groupings": unique_groups,
-                "ai_recommended_group": rec,
-            }
+        if chosen_group is not None:
+            filtered = [r for r in results if r.get("region_group") == chosen_group]
+            if filtered:
+                exact = [r for r in filtered if r["name"].lower() == query.lower()]
+                return exact[0] if exact else filtered[0]
 
-        if chosen_group == _AI_CHOOSE:
-            chosen_group = _pick_recommended_group(unique_groups)
-
-        filtered = [r for r in results if r.get("region_group") == chosen_group]
-        if filtered:
-            # Within the chosen group, prefer an exact name match over a partial one.
-            exact = [r for r in filtered if r["name"].lower() == query.lower()]
-            return exact[0] if exact else filtered[0]
+        # Elicitation failed, was declined, or was cancelled.
+        # Do NOT silently pick a group — signal callers to ask the user.
+        return {
+            "_disambiguation_required": True,
+            "region_name": region_name,
+            "available_groupings": unique_groups,
+        }
 
     # Single grouping or purely national results — prefer exact name match, else first.
     exact = [r for r in results if r["name"].lower() == query.lower()]
@@ -1138,25 +1077,20 @@ async def get_latest_value(
     "What is the literacy rate in Kenya?" or "What was the completion rate in
     Sub-Saharan Africa in 2015?"
 
-    IMPORTANT — when to omit geo_unit_code:
-    Omit geo_unit_code in ALL cases except when you hold an exact, previously-confirmed
-    code from a prior tool result (e.g. "KEN" typed directly by the user, or a code
-    returned by search_geo_units after the user confirmed a grouping). NEVER construct or
-    guess a code yourself, even for regions the user named explicitly. When omitted, the
-    tool handles lookup and grouping disambiguation automatically.
-
-    If the tool returns error="geography_disambiguation_required", ask the user which
-    grouping system to use (show available_groupings), then call
-    search_geo_units(query=region_name, region_group=<chosen>) to get the exact code,
-    and retry this tool with geo_unit_code set to that code.
+    GEOGRAPHY RULES:
+    - For countries: pass the ISO3 code directly (e.g. "KEN", "FRA").
+    - For regions: ALWAYS call search_geo_units first — it will ask the user which
+      grouping system to use. Regional names map to multiple codes with different
+      country compositions; using the wrong one gives silently wrong data.
+    - If omitted, the tool will interactively ask the user for the geography.
 
     To find indicator codes, use search_indicators. Always show the user the year
     alongside the value, since data is not always available for the most recent years.
 
     Args:
         indicator_code: The indicator code (e.g. "CR.1", "LR.AG15T99").
-        geo_unit_code: Optional. Only pass a confirmed code from a prior tool result
-                       (e.g. "KEN"). Omit to trigger geography lookup and disambiguation.
+        geo_unit_code: ISO3 code for countries, or a confirmed code from search_geo_units
+                       for regions. Omit to trigger interactive geography lookup.
         year: Optional. The specific year to retrieve. If omitted, returns the
               most recent available value. If no data exists for the requested
               year, returns the nearest available year instead, with a note.
@@ -1223,20 +1157,18 @@ async def get_latest_value(
             return {"error": "Could not resolve geography. Please provide a geo_unit_code directly."}
         if resolved.get("_disambiguation_required"):
             groups = resolved["available_groupings"]
-            rec = resolved["ai_recommended_group"]
             name = resolved["region_name"]
             return {
                 "error": "geography_disambiguation_required",
                 "region_name": name,
                 "available_groupings": groups,
-                "recommended_grouping": rec,
                 "instruction": (
                     f"'{name}' exists in multiple regional grouping systems: "
-                    f"{', '.join(groups)}. You MUST ask the user which grouping to use. "
-                    f"Suggest '{rec}' as a sensible default (aligns with UNESCO/SDG reporting). "
-                    f"Once the user chooses, call search_geo_units(query='{name}', "
-                    f"region_group='<chosen>') to get the exact code, then retry this tool "
-                    f"with geo_unit_code set to that code."
+                    f"{', '.join(groups)}. Each defines different boundaries and includes "
+                    f"different countries. Ask the user which grouping to use. Present all "
+                    f"options and let them choose. Once they choose, call "
+                    f"search_geo_units(query='{name}', region_group='<chosen>') to get "
+                    f"the exact code, then retry this tool with that geo_unit_code."
                 ),
             }
 

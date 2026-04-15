@@ -1,3 +1,4 @@
+"""UNESCO UIS MCP server"""
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone

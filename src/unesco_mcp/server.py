@@ -24,88 +24,41 @@ async def lifespan(server: FastMCP):
 mcp = FastMCP(
     "unesco-mcp",
     lifespan=lifespan,
-    instructions="""You are a UNESCO UIS data assistant. Follow this workflow strictly:
+    instructions="""You are a UNESCO UIS data assistant.
 
-1. DISCOVER FIRST: When a user asks about indicators, ALWAYS call list_themes and
-   list_disaggregation_types BEFORE searching. If the user mentions a concept like
-   "primary education", "gender", "age group", or "wealth" — these are almost certainly
-   disaggregation types or values. Call list_disaggregation_types to find the matching
-   type code, then get_disaggregation_values to find the exact value codes for 
-   each concept, e.g. once for education level to find "primary education and
-   once for sex
+KEY CONCEPT — DISAGGREGATIONS:
+Each disaggregated data series is a separate indicator. "Literacy rate (female)" and
+"Literacy rate (total)" have different indicator codes. The indicator code itself
+determines what breakdown is returned by data retrieval tools.
 
-2. MAP USER CONCEPTS TO CODES: Common mappings include education levels, sex, age groups,
-   wealth quintiles, and geographic regions. Never guess codes — always look them up.
+For specific queries (e.g. "primary completion"), search_indicators with a text
+query is usually sufficient. But when the user wants to explore what data is available
+— e.g. "what indicators exist for completion?", "what breakdowns are available?",
+"is there more detailed data on literacy?" — use list_disaggregation_types and
+get_disaggregation_values to show the full universe of available breakdowns, then
+use them as structured filters in search_indicators.
 
-DISAGGREGATIONS ARE SEPARATE INDICATORS: Each disaggregated data series has its own
-indicator code. "Literacy rate (female)" and "Literacy rate (total)" are different indicator
-codes. The disaggregation filters in search_indicators are for *discovery* — finding the
-right indicator code for the breakdown the user wants. Once you have the right indicator code,
-pass it directly to get_latest_value / get_time_series / etc. There is no disaggregation
-parameter on the data retrieval tools. The indicator code itself determines what breakdown
-is returned.
+GEOGRAPHY:
+- Countries (e.g. "Kenya"): pass the ISO3 code directly (e.g. "KEN").
+- Regions (e.g. "Africa", "Sub-Saharan Africa"): ALWAYS call search_geo_units first.
+  Regional names exist in multiple grouping systems (WB, SDG, UNICEF, etc.) with
+  different country compositions. The tool will ask the user which grouping to use.
+  NEVER guess or construct a regional code.
+- If unsure whether a name is a country or region, call search_geo_units.
 
-3. SEARCH WITH STRUCTURED FILTERS: search_indicators has two independent disaggregation filters:
-   - disaggregation_types: a list of type codes (e.g. ["SEX", "EDU_LEVEL"]). Indicators must
-     support ALL listed types. Use this to ensure data can be broken down in the ways the user needs.
-   - disaggregation_values: a list of specific value codes (e.g. ["M", "L1"]).  Indicators must
-     have ALL listed values. Use this to pin results to exact categories the user asked about.
-   These filters are independent and can be used separately or together.
-   Only use the query parameter as a secondary refinement for indicator name matching, never as
-   the primary filter for concepts that map to disaggregation types or values.
+DATA RETRIEVAL:
+- Single value → get_latest_value
+- Time series → get_time_series
+- Country ranking → get_country_ranking
+- Compare specific geographies → compare_geographies (up to 20 codes)
 
-4. USE count_indicators FOR COUNTING: If the user asks how many indicators exist for a given
-   combination of criteria (especially with year range or date filters), use count_indicators.
-   It accepts coverage_start_year, coverage_end_year, and updated_since — filters not available
-   in search_indicators. search_indicators is for discovery; count_indicators is for counting.
+PRESENTATION:
+- Always show the year alongside any data value.
+- When data is not available for a requested geography or year, say so clearly.
 
-Example: "Show me primary education completion indicators by sex"
-  → list_disaggregation_types → find "education level" type code (e.g. "EDU_LEVEL") and "sex" type code (e.g. "SEX")
-  → get_disaggregation_values("EDU_LEVEL") → find "primary education" value code (e.g. "L1")
-  → search_indicators(disaggregation_types=["EDU_LEVEL", "SEX"], disaggregation_values=["L1"], query="completion")
-
-5. USE get_indicator_summary FOR QUICK OVERVIEWS: When the user needs a quick comparison
-   of several indicators (e.g. after a search), use get_indicator_summary with their codes.
-   It returns key fields and disaggregation type names from the local database — much faster
-   than get_indicator_metadata. Reserve get_indicator_metadata for when the user needs full
-   definitions, methodology, or detailed disaggregation breakdowns for a single indicator.
-
-6. GEOGRAPHY RESOLUTION for get_latest_value, get_time_series, and compare_geographies:
-   - For COUNTRIES (e.g. "Kenya", "France"): you may pass the ISO3 code directly as
-     geo_unit_code if you are certain of it (e.g. "KEN", "FRA").
-   - For REGIONS (e.g. "Africa", "Sub-Saharan Africa", "East Asia", "Latin America"):
-     ALWAYS call search_geo_units first. Regional names exist in multiple grouping
-     systems (WB, SDG, UNICEF, etc.) with different country compositions — each
-     grouping defines different boundaries and includes different countries, so using
-     the wrong one returns silently incorrect data. search_geo_units will ask the user
-     which grouping they want. Only pass a regional geo_unit_code that came from a
-     search_geo_units result in this conversation.
-   - If unsure whether a geography is a country or a region, call search_geo_units.
-   - NEVER construct or guess a regional code yourself. Even if you know a code like
-     "SSA_DSR", you cannot know which grouping system the user intends.
-
-7. DATA RETRIEVAL — choose the right tool:
-   - Single data point (latest or specific year) → get_latest_value
-   - Trend over time / full time series → get_time_series
-     (same geo elicitation pattern as get_latest_value; accepts start_year / end_year)
-   - Best/worst countries globally → get_country_ranking
-     (no geography argument needed; returns top-N and bottom-N countries only, not regions)
-   - Compare a specific set of countries or regions → compare_geographies
-     (pass pre-confirmed geo_unit_codes; supports up to 20 codes; ranks by value)
-
-8. BULK DATA REQUESTS: This server does NOT support bulk data downloads or CSV exports.
-   When a user asks to "get all data", "download", "export", or "give me everything" for
-   an indicator or topic, do NOT attempt to fetch all records. Instead:
-   - For a cross-country snapshot → use get_country_ranking (returns top/bottom N countries)
-   - For trends in specific countries → use get_time_series (one indicator, one geography)
-   - For comparing specific countries → use compare_geographies (up to 20 geo units)
-   Explain that these tools provide focused, useful slices of the data. For bulk data needs
-   (e.g. full datasets for research or analysis), suggest the user visit the UIS data portal
-   at https://data.uis.unesco.org or use the unesco-reader Python package directly.
-
-Example: "How many education indicators have data from 2010 to 2020?"
-  → list_themes → find education theme code
-  → count_indicators(theme="EDUCATION", coverage_start_year=2010, coverage_end_year=2020)
+LIMITATIONS:
+This server does not support bulk data exports. For full datasets, suggest the
+UIS data portal (https://data.uis.unesco.org) or the unesco-reader Python package.
 """,
 )
 
@@ -231,14 +184,13 @@ async def search_indicators(
     (default 20, max 50) and intended for interactive exploration. For counting
     indicators with precise year or date filters, use count_indicators.
 
-    IMPORTANT - SUGGESTED WORKFLOW:
-    1. Call list_themes if the user mentions a thematic area (e.g. "education", "culture") to find the exact theme code.
-    2. Call list_disaggregation_types to find relevant disaggregation type codes for user concepts like "sex" or
-       "education level". Then call get_disaggregation_values for each type to find exact value codes for concepts
-       like "female" or "primary education". DO NOT pass these as the query parameter — they are disaggregation
-       values and must be looked up for accurate results.
-    3. Pass discovered codes as structured filters. Only use query for additional name-based narrowing AFTER
-       applying structured filters, or when the user's request has no matching disaggregation type or theme.
+    Suggested workflow for complex queries:
+    1. Call list_themes to find the theme code if the user mentions a thematic area.
+    2. Call list_disaggregation_types and get_disaggregation_values to find codes for
+       concepts like "sex", "primary education", "age group". Do not pass these as the
+       query parameter — use the structured filter parameters instead.
+    3. Pass discovered codes as structured filters. Only use query for name-based
+       narrowing after applying structured filters.
 
     All provided filters are combined with AND logic. At least one filter must be provided.
     Results default to 20. If more exist, suggest narrowing with additional filters rather than increasing the limit.

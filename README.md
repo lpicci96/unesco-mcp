@@ -54,7 +54,8 @@ Data is cached locally in SQLite for fast indicator discovery, while live API ca
 
 ### Hosted (recommended)
 
-The server is hosted on [Prefect Horizon](https://horizon.prefect.io) — no local setup needed.
+The server is hosted on [Prefect Horizon](https://horizon.prefect.io) (free tier) — no local setup needed.
+Free tier usage may have limits; if you experience issues, consider [running locally](#local-from-source).
 
 Use this URL in any MCP-compatible client:
 

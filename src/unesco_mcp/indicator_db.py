@@ -8,7 +8,7 @@ from pathlib import Path
 
 import unesco_reader as uis
 
-from unesco_mcp.config import DB_TTL_HOURS, MAX_RESULTS, MAX_RESULTS_CAP, MAX_SUMMARY_CODES
+from unesco_mcp.config import DB_TTL_HOURS
 
 DB_PATH = Path(__file__).parent / "uis.db"
 

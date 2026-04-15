@@ -423,13 +423,12 @@ def store_indicator_disaggregations():
         conn.executemany("""
             INSERT OR REPLACE INTO indicator_disaggregations
             (indicator_code, disaggregation_id)
-            VALUES (
-                ?,
-                (SELECT dv.id FROM disaggregation_values dv
-                 JOIN disaggregation_types dt ON dt.id = dv.type_id
-                 WHERE dt.type_code = ? AND dv.code = ?)
-               )
-            """, rows)
+            SELECT ?, dv.id
+            FROM disaggregation_values dv
+            JOIN disaggregation_types dt ON dt.id = dv.type_id
+            WHERE dt.type_code = ? AND dv.code = ?
+            AND EXISTS (SELECT 1 FROM indicators WHERE code = ?)
+            """, [(ic, tc, dc, ic) for ic, tc, dc in rows])
 
 
 def query(sql: str, params: tuple = ()) -> list[dict]:

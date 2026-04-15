@@ -52,14 +52,39 @@ Data is cached locally in SQLite for fast indicator discovery, while live API ca
 
 ## Installation
 
-This server runs over stdio and works with any MCP-compatible client. Below are setup instructions for common clients.
+### Hosted (recommended)
 
-### Claude Desktop
+The server is hosted on [Prefect Horizon](https://horizon.prefect.io) — no local setup needed.
 
-Add to your Claude Desktop config file:
+Use this URL in any MCP-compatible client:
 
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+```
+https://unesco.fastmcp.app/mcp
+```
+
+For example, in Claude Desktop config:
+
+```json
+{
+  "mcpServers": {
+    "unesco-mcp": {
+      "url": "https://unesco.fastmcp.app/mcp"
+    }
+  }
+}
+```
+
+Or in Claude Code:
+
+```bash
+claude mcp add unesco-mcp --url https://unesco.fastmcp.app/mcp
+```
+
+### Local (from source)
+
+To run the server locally instead:
+
+**Claude Desktop** — add to your config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
@@ -72,9 +97,7 @@ Add to your Claude Desktop config file:
 }
 ```
 
-Then restart Claude Desktop.
-
-### Claude Code
+**Claude Code:**
 
 ```bash
 claude mcp add unesco-mcp -- uv run --directory /path/to/unesco-mcp unesco-mcp

@@ -1,17 +1,15 @@
 """SQLite database for caching UNESCO UIS indicators and disaggregation metadata."""
 
-import csv
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import unesco_reader as uis
 
+from unesco_mcp.config import DB_TTL_HOURS
+
 DB_PATH = Path(__file__).parent / "uis.db"
-MAX_RESULTS = 20
-MAX_RESULTS_CAP = 50
-MAX_SUMMARY_CODES = 10
 
 
 @contextmanager
@@ -122,6 +120,17 @@ def _themes_table():
            """
 
 
+def _db_meta_table():
+    """Return CREATE TABLE statement for the db_meta key-value table."""
+
+    return """
+           CREATE TABLE IF NOT EXISTS db_meta (
+               key TEXT PRIMARY KEY,
+               value TEXT NOT NULL
+           )
+           """
+
+
 def _fts_table():
     """Return CREATE VIRTUAL TABLE statement for FTS5 full-text search on indicator names."""
 
@@ -160,6 +169,7 @@ def init_db():
         cursor.execute(_geo_units_table())
         cursor.execute(_geo_units_fts_table())
         cursor.execute(_fts_table())
+        cursor.execute(_db_meta_table())
         cursor.execute(_disaggregations_type_table())
         cursor.execute(_disaggregations_values_table())
         cursor.execute(_indicator_disaggregations_table())
@@ -413,13 +423,12 @@ def store_indicator_disaggregations():
         conn.executemany("""
             INSERT OR REPLACE INTO indicator_disaggregations
             (indicator_code, disaggregation_id)
-            VALUES (
-                ?,
-                (SELECT dv.id FROM disaggregation_values dv
-                 JOIN disaggregation_types dt ON dt.id = dv.type_id
-                 WHERE dt.type_code = ? AND dv.code = ?)
-               )
-            """, rows)
+            SELECT ?, dv.id
+            FROM disaggregation_values dv
+            JOIN disaggregation_types dt ON dt.id = dv.type_id
+            WHERE dt.type_code = ? AND dv.code = ?
+            AND EXISTS (SELECT 1 FROM indicators WHERE code = ?)
+            """, [(ic, tc, dc, ic) for ic, tc, dc in rows])
 
 
 def query(sql: str, params: tuple = ()) -> list[dict]:
@@ -627,113 +636,35 @@ def count_indicators(
     return rows[0]["cnt"] if rows else 0
 
 
-EXPORT_FIELDNAMES = [
-    "code", "name", "theme", "timeLine_min", "timeLine_max",
-    "totalRecordCount", "lastDataUpdate", "disaggregation_types",
-]
-
-
-def get_export_rows(
-    query_term: str | None = None,
-    theme: str | None = None,
-    disaggregation_types: list[str] | None = None,
-    disaggregation_values: list[str] | None = None,
-) -> list[dict]:
-    """Fetch all matching indicators with disaggregation_types merged in.
-
-    Uses the same filter logic as search_indicators but with no result limit.
-    Each row has disaggregation_types as a semicolon-separated string.
-    """
-    conditions, params = _build_indicator_conditions(
-        theme=theme,
-        disaggregation_types=disaggregation_types,
-        disaggregation_values=disaggregation_values,
-    )
-    joins: list[str] = []
-
-    if query_term is not None:
-        joins.append("JOIN indicators_fts fts ON fts.code = i.code")
-        conditions.append("indicators_fts MATCH ?")
-        params.append(query_term)
-
-    join_clause = " ".join(joins)
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
-    indicators = query(
-        f"SELECT i.code, i.name, i.theme, i.timeLine_min, i.timeLine_max, "
-        f"i.totalRecordCount, i.lastDataUpdate "
-        f"FROM indicators i {join_clause} {where}",
-        tuple(params),
-    )
-
-    if not indicators:
-        return []
-
-    # Attach disaggregation type names
-    codes = [ind["code"] for ind in indicators]
-    placeholders = ", ".join("?" for _ in codes)
-    disagg_rows = query(
-        f"SELECT id_map.indicator_code, dt.type_name "
-        f"FROM indicator_disaggregations id_map "
-        f"JOIN disaggregation_values dv ON dv.id = id_map.disaggregation_id "
-        f"JOIN disaggregation_types dt ON dt.id = dv.type_id "
-        f"WHERE id_map.indicator_code IN ({placeholders}) "
-        f"GROUP BY id_map.indicator_code, dt.type_name",
-        tuple(codes),
-    )
-    disagg_by_code: dict[str, list[str]] = {}
-    for row in disagg_rows:
-        disagg_by_code.setdefault(row["indicator_code"], []).append(row["type_name"])
-
-    for ind in indicators:
-        ind["disaggregation_types"] = "; ".join(disagg_by_code.get(ind["code"], []))
-
-    return indicators
-
-
-def write_export_csv(rows: list[dict], label: str = "indicators") -> str:
-    """Write export rows to ~/Downloads (falling back to home dir).
-
-    Uses a timestamped filename so repeated exports don't overwrite each other.
-    Returns the absolute file path.
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"unesco_{label}_{timestamp}.csv"
-
-    downloads = Path.home() / "Downloads"
-    out_dir = downloads if downloads.is_dir() else Path.home()
-    file_path = out_dir / filename
-
-    with open(file_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    return str(file_path)
-
-
-DATA_EXPORT_FIELDNAMES = [
-    "indicator_code", "indicator_name",
-    "geo_unit_code", "geo_unit_name",
-    "year", "value", "qualifier",
-]
-
-
-def write_data_csv(rows: list[dict], label: str = "data") -> str:
-    """Write data export rows to ~/Downloads (falling back to home dir)."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"unesco_{label}_{timestamp}.csv"
-    downloads = Path.home() / "Downloads"
-    out_dir = downloads if downloads.is_dir() else Path.home()
-    file_path = out_dir / filename
-    with open(file_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=DATA_EXPORT_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
-    return str(file_path)
-
-
 # ── Build ──────────────────────────────────────────────────────────────────
+
+
+_REQUIRED_TABLES = {"indicators", "themes", "geo_units", "db_meta", "disaggregation_types"}
+
+
+def is_db_fresh() -> bool:
+    """Check whether the cached database exists, is complete, and is within the TTL."""
+    if not DB_PATH.exists():
+        return False
+    try:
+        # Verify core tables exist (catches empty or partially-built DBs)
+        rows = query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            f"({', '.join('?' for _ in _REQUIRED_TABLES)})",
+            tuple(_REQUIRED_TABLES),
+        )
+        if {r["name"] for r in rows} != _REQUIRED_TABLES:
+            return False
+
+        # Check TTL
+        rows = query("SELECT value FROM db_meta WHERE key = 'built_at'")
+        if not rows:
+            return False
+        built_at = datetime.fromisoformat(rows[0]["value"])
+        age = datetime.now(timezone.utc) - built_at
+        return age.total_seconds() < DB_TTL_HOURS * 3600
+    except Exception:
+        return False
 
 
 def build_db(fresh: bool = False):
@@ -741,10 +672,13 @@ def build_db(fresh: bool = False):
 
     Args:
         fresh: If True, delete the existing database and rebuild from scratch.
+               If False (default), skip the rebuild when the DB is within TTL.
     """
 
-    if fresh:
-        teardown_db()
+    if not fresh and is_db_fresh():
+        return
+
+    teardown_db()
     init_db()
     store_indicators()
     store_themes()
@@ -754,6 +688,18 @@ def build_db(fresh: bool = False):
     store_disaggregation_types(disaggregations)
     store_disaggregation_values(disaggregations)
     store_indicator_disaggregations()
+
+    with _get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value) VALUES (?, ?)",
+            ("built_at", datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def ensure_fresh():
+    """Rebuild the DB if the TTL has expired (for long-running servers)."""
+    if not is_db_fresh():
+        build_db(fresh=True)
 
 
 def teardown_db():

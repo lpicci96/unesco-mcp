@@ -532,7 +532,7 @@ def _rows_to_ranking(subset) -> list[dict]:
 def _safe_qualifier(row) -> str | None:
     """Return the qualifier string, or None if absent / NaN."""
     q = row.get("qualifier")
-    if q and str(q) != "nan":
+    if pd.notna(q):
         return str(q)
     return None
 
@@ -908,7 +908,7 @@ async def compare_geographies(
             row = sub.sort_values("year").iloc[-1]
 
         val = row.get("value")
-        if val is None or str(val) == "nan":
+        if not pd.notna(val):
             missing_codes.append(code)
             continue
 
@@ -1155,7 +1155,7 @@ async def get_latest_value(
         note = f"Most recent available year. Data exists from {year_min} to {year_max}."
 
     record = row.iloc[0]
-    qualifier = record["qualifier"] if record["qualifier"] and str(record["qualifier"]) != "nan" else None
+    qualifier = _safe_qualifier(record)
 
     return {
         "indicator_code": record["indicatorId"],

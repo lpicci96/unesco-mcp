@@ -38,5 +38,8 @@ Repository = "https://github.com/lucapicci/unesco-mcp"
 Issues = "https://github.com/lucapicci/unesco-mcp/issues"
 Changelog = "https://github.com/lucapicci/unesco-mcp/blob/main/CHANGELOG.md"
 
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-mock>=3.14"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/unesco_mcp"]

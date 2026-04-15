@@ -8,7 +8,6 @@ from unesco_reader.exceptions import NoDataError, TooManyRecordsError
 
 from unesco_mcp.indicator_db import (
     build_db,
-    teardown_db,
     query as db_query,
     search_indicators as db_search_indicators,
     count_indicators as db_count_indicators,
@@ -26,12 +25,9 @@ from unesco_mcp.indicator_db import (
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
-    """Build the indicator DB on startup, tear it down on shutdown."""
-    build_db(fresh=True)
-    try:
-        yield
-    finally:
-        teardown_db()
+    """Build the indicator DB on startup if stale, keep it across restarts."""
+    build_db()
+    yield
 
 
 mcp = FastMCP(

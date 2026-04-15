@@ -3,10 +3,12 @@
 import csv
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import unesco_reader as uis
+
+from unesco_mcp.config import DB_TTL_HOURS
 
 DB_PATH = Path(__file__).parent / "uis.db"
 MAX_RESULTS = 20
@@ -122,6 +124,17 @@ def _themes_table():
            """
 
 
+def _db_meta_table():
+    """Return CREATE TABLE statement for the db_meta key-value table."""
+
+    return """
+           CREATE TABLE IF NOT EXISTS db_meta (
+               key TEXT PRIMARY KEY,
+               value TEXT NOT NULL
+           )
+           """
+
+
 def _fts_table():
     """Return CREATE VIRTUAL TABLE statement for FTS5 full-text search on indicator names."""
 
@@ -160,6 +173,7 @@ def init_db():
         cursor.execute(_geo_units_table())
         cursor.execute(_geo_units_fts_table())
         cursor.execute(_fts_table())
+        cursor.execute(_db_meta_table())
         cursor.execute(_disaggregations_type_table())
         cursor.execute(_disaggregations_values_table())
         cursor.execute(_indicator_disaggregations_table())
@@ -736,15 +750,33 @@ def write_data_csv(rows: list[dict], label: str = "data") -> str:
 # ── Build ──────────────────────────────────────────────────────────────────
 
 
+def is_db_fresh() -> bool:
+    """Check whether the cached database exists and is within the TTL."""
+    if not DB_PATH.exists():
+        return False
+    try:
+        rows = query("SELECT value FROM db_meta WHERE key = 'built_at'")
+        if not rows:
+            return False
+        built_at = datetime.fromisoformat(rows[0]["value"])
+        age = datetime.now(timezone.utc) - built_at
+        return age.total_seconds() < DB_TTL_HOURS * 3600
+    except Exception:
+        return False
+
+
 def build_db(fresh: bool = False):
     """Initialize the database and populate all tables.
 
     Args:
         fresh: If True, delete the existing database and rebuild from scratch.
+               If False (default), skip the rebuild when the DB is within TTL.
     """
 
-    if fresh:
-        teardown_db()
+    if not fresh and is_db_fresh():
+        return
+
+    teardown_db()
     init_db()
     store_indicators()
     store_themes()
@@ -754,6 +786,12 @@ def build_db(fresh: bool = False):
     store_disaggregation_types(disaggregations)
     store_disaggregation_values(disaggregations)
     store_indicator_disaggregations()
+
+    with _get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value) VALUES (?, ?)",
+            ("built_at", datetime.now(timezone.utc).isoformat()),
+        )
 
 
 def teardown_db():

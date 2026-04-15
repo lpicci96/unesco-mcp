@@ -8,12 +8,9 @@ from pathlib import Path
 
 import unesco_reader as uis
 
-from unesco_mcp.config import DB_TTL_HOURS
+from unesco_mcp.config import DB_TTL_HOURS, MAX_RESULTS, MAX_RESULTS_CAP, MAX_SUMMARY_CODES
 
 DB_PATH = Path(__file__).parent / "uis.db"
-MAX_RESULTS = 20
-MAX_RESULTS_CAP = 50
-MAX_SUMMARY_CODES = 10
 
 
 @contextmanager

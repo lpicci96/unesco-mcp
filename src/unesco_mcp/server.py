@@ -6,6 +6,7 @@ from fastmcp import FastMCP, Context
 import unesco_reader as uis
 from unesco_reader.exceptions import NoDataError, TooManyRecordsError
 
+from unesco_mcp.config import MAX_RESULTS, MAX_RESULTS_CAP, MAX_SUMMARY_CODES
 from unesco_mcp.indicator_db import (
     build_db,
     query as db_query,
@@ -17,9 +18,6 @@ from unesco_mcp.indicator_db import (
     search_geo_units as db_search_geo_units,
     write_export_csv,
     write_data_csv,
-    MAX_RESULTS,
-    MAX_RESULTS_CAP,
-    MAX_SUMMARY_CODES,
 )
 
 

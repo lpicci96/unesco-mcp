@@ -12,9 +12,12 @@ from unesco_mcp import uis_db
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
-    """Build the indicator DB on startup if stale, keep it across restarts."""
-    uis_db.build_db()
-    yield
+    """Build the indicator DB on startup, tear it down on shutdown."""
+    uis_db.build_db(fresh=True)
+    try:
+        yield
+    finally:
+        uis_db.teardown_db()
 
 
 mcp = FastMCP(
@@ -142,6 +145,7 @@ async def list_themes() -> dict:
             - "hint": A string providing guidance on how to use the theme codes for searching indicators
     """
 
+    uis_db.ensure_fresh()
     themes = uis_db.get_themes()
 
     return {
@@ -165,6 +169,7 @@ async def list_disaggregation_types() -> dict:
             - "hint": Guidance on how to use the type codes.
     """
 
+    uis_db.ensure_fresh()
     rows = uis_db.query("SELECT type_code, type_name FROM disaggregation_types ORDER BY type_name")
 
     return {
@@ -191,6 +196,8 @@ async def get_disaggregation_values(type_code: str) -> dict:
             - "values": A list of dicts, each with 'code', 'name', and 'description'.
             - "count": The total number of values.
     """
+
+    uis_db.ensure_fresh()
 
     # Verify the type exists
     type_rows = uis_db.query(
@@ -269,6 +276,7 @@ async def search_indicators(
     if not any([query, theme, disaggregation_types, disaggregation_values]):
         return {"error": "At least one filter parameter must be provided."}
 
+    uis_db.ensure_fresh()
     effective_limit = min(max(limit, 1), MAX_RESULTS_CAP)
 
     results, total = uis_db.search_indicators(
@@ -329,6 +337,7 @@ async def count_indicators(
             - "count": The exact number of indicators matching all provided filters.
             - "filters_applied": A summary of which filters were used.
     """
+    uis_db.ensure_fresh()
     count = uis_db.count_indicators(
         theme=theme,
         disaggregation_types=disaggregation_types,
@@ -461,6 +470,8 @@ async def get_indicator_summary(indicator_codes: list[str]) -> dict:
     if len(indicator_codes) > MAX_SUMMARY_CODES:
         return {"error": f"Maximum {MAX_SUMMARY_CODES} indicator codes allowed per request."}
 
+    uis_db.ensure_fresh()
+
     summaries = uis_db.get_indicator_summaries(indicator_codes)
     found_codes = {s["code"] for s in summaries}
     not_found = [c for c in indicator_codes if c not in found_codes]
@@ -503,6 +514,7 @@ async def export_indicators(
     if not any([query, theme, disaggregation_types, disaggregation_values]):
         return {"error": "At least one filter parameter must be provided."}
 
+    uis_db.ensure_fresh()
     rows = uis_db.get_export_rows(
         query_term=query,
         theme=theme,
@@ -663,6 +675,7 @@ async def search_geo_units(
             - "count": Number of results returned.
             - "hint": Guidance on next steps.
     """
+    uis_db.ensure_fresh()
     results = uis_db.search_geo_units(
         query_term=query,
         type_filter=type_filter,
@@ -1205,6 +1218,7 @@ async def _resolve_geo_unit(ctx: Context, results: list[dict], query: str) -> di
 
     Returns the resolved geo unit dict, or None if there are no results.
     """
+    uis_db.ensure_fresh()
     if not results:
         return None
     if len(results) == 1:

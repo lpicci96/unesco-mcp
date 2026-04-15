@@ -7,6 +7,7 @@ import pandas as pd
 from unesco_mcp import uis_db
 from unesco_mcp.uis_db import (
     build_db,
+    ensure_fresh,
     init_db,
     is_db_fresh,
     query,
@@ -107,8 +108,27 @@ class TestIsDbFresh:
             )
         assert is_db_fresh() is True
 
+    def test_false_on_empty_db_file(self):
+        uis_db.DB_PATH.touch()  # 0-byte file, no tables
+        assert is_db_fresh() is False
+
     def test_false_on_corrupted_db(self):
         uis_db.DB_PATH.write_bytes(b"not a sqlite database")
+        assert is_db_fresh() is False
+
+    def test_false_when_tables_missing(self):
+        """DB has db_meta with fresh timestamp but is missing other tables."""
+        import sqlite3
+        conn = sqlite3.connect(uis_db.DB_PATH)
+        conn.execute(
+            "CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO db_meta (key, value) VALUES (?, ?)",
+            ("built_at", datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
         assert is_db_fresh() is False
 
 
@@ -239,3 +259,37 @@ class TestBuildDb:
         codes = [r["code"] for r in indicators_after]
         assert codes == ["NEW.1"]
         assert "TEST.1" not in codes
+
+
+# ── ensure_fresh ─────────────────────────────────────────────────────────────
+
+
+class TestEnsureFresh:
+    def test_skips_when_fresh(self, mock_uis, mocker):
+        build_db(fresh=True)
+
+        spy = mocker.patch("unesco_mcp.uis_db.store_indicators", wraps=None)
+        ensure_fresh()  # DB was just built, should be within TTL
+        spy.assert_not_called()
+
+    def test_rebuilds_when_stale(self, mock_uis, mocker):
+        build_db(fresh=True)
+
+        # Age the timestamp past the TTL
+        old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        with _get_connection() as conn:
+            conn.execute(
+                "UPDATE db_meta SET value = ? WHERE key = 'built_at'",
+                (old,),
+            )
+
+        spy = mocker.patch("unesco_mcp.uis_db.store_indicators", wraps=None)
+        mocker.patch("unesco_mcp.uis_db.store_themes")
+        mocker.patch("unesco_mcp.uis_db.store_geo_units")
+        mocker.patch("unesco_mcp.uis_db.get_disaggregations", return_value={})
+        mocker.patch("unesco_mcp.uis_db.store_disaggregation_types")
+        mocker.patch("unesco_mcp.uis_db.store_disaggregation_values")
+        mocker.patch("unesco_mcp.uis_db.store_indicator_disaggregations")
+
+        ensure_fresh()
+        spy.assert_called_once()

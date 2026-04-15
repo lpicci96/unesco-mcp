@@ -747,11 +747,24 @@ def write_data_csv(rows: list[dict], label: str = "data") -> str:
 # ── Build ──────────────────────────────────────────────────────────────────
 
 
+_REQUIRED_TABLES = {"indicators", "themes", "geo_units", "db_meta", "disaggregation_types"}
+
+
 def is_db_fresh() -> bool:
-    """Check whether the cached database exists and is within the TTL."""
+    """Check whether the cached database exists, is complete, and is within the TTL."""
     if not DB_PATH.exists():
         return False
     try:
+        # Verify core tables exist (catches empty or partially-built DBs)
+        rows = query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            f"({', '.join('?' for _ in _REQUIRED_TABLES)})",
+            tuple(_REQUIRED_TABLES),
+        )
+        if {r["name"] for r in rows} != _REQUIRED_TABLES:
+            return False
+
+        # Check TTL
         rows = query("SELECT value FROM db_meta WHERE key = 'built_at'")
         if not rows:
             return False
@@ -789,6 +802,12 @@ def build_db(fresh: bool = False):
             "INSERT OR REPLACE INTO db_meta (key, value) VALUES (?, ?)",
             ("built_at", datetime.now(timezone.utc).isoformat()),
         )
+
+
+def ensure_fresh():
+    """Rebuild the DB if the TTL has expired (for long-running servers)."""
+    if not is_db_fresh():
+        build_db(fresh=True)
 
 
 def teardown_db():

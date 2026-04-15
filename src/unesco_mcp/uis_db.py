@@ -642,6 +642,15 @@ def count_indicators(
 # ── Build ──────────────────────────────────────────────────────────────────
 
 
+def db_built_at() -> str | None:
+    """Return the ISO timestamp of the last DB build, or None if unavailable."""
+    try:
+        rows = query("SELECT value FROM db_meta WHERE key = 'built_at'")
+        return rows[0]["value"] if rows else None
+    except Exception:
+        return None
+
+
 _REQUIRED_TABLES = {"indicators", "themes", "geo_units", "db_meta", "disaggregation_types"}
 
 

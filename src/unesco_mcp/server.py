@@ -72,6 +72,7 @@ def server_status() -> dict[str, str]:
         "server": "unesco-mcp",
         "status": "ok",
         "utc_time": datetime.now(timezone.utc).isoformat(),
+        "db_last_refreshed": uis_db.db_built_at(),
     }
 
 

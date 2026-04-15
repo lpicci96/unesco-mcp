@@ -1,6 +1,7 @@
 """SQLite database for caching UNESCO UIS indicators and disaggregation metadata."""
 
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,7 +10,7 @@ import unesco_reader as uis
 
 from unesco_mcp.config import DB_TTL_HOURS
 
-DB_PATH = Path(__file__).parent / "uis.db"
+DB_PATH = Path(tempfile.gettempdir()) / "unesco_mcp" / "uis.db"
 
 
 @contextmanager
@@ -160,6 +161,8 @@ def _indexes():
 
 def init_db():
     """Create all tables and indexes if they don't already exist."""
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with _get_connection() as conn:
         cursor = conn.cursor()
@@ -637,6 +640,15 @@ def count_indicators(
 
 
 # ── Build ──────────────────────────────────────────────────────────────────
+
+
+def db_built_at() -> str | None:
+    """Return the ISO timestamp of the last DB build, or None if unavailable."""
+    try:
+        rows = query("SELECT value FROM db_meta WHERE key = 'built_at'")
+        return rows[0]["value"] if rows else None
+    except Exception:
+        return None
 
 
 _REQUIRED_TABLES = {"indicators", "themes", "geo_units", "db_meta", "disaggregation_types"}

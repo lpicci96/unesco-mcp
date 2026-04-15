@@ -2,6 +2,7 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import pandas as pd
 from fastmcp import FastMCP, Context
 import unesco_reader as uis
 from unesco_reader.exceptions import NoDataError, TooManyRecordsError
@@ -150,7 +151,7 @@ async def list_themes() -> dict:
 
     return {
         "theme information": themes,
-        "theme count": str(len(themes)),
+        "theme count": len(themes),
         "hint": "The theme code is useful for searching indicators, but does not need to be shown to the user"
     }
 
@@ -919,7 +920,7 @@ async def get_time_series(
             "qualifier": _safe_qualifier(row),
         }
         for _, row in df.iterrows()
-        if not (str(row.get("value", "nan")) == "nan")
+        if pd.notna(row.get("value"))
     ]
 
     values = [p["value"] for p in data_points]

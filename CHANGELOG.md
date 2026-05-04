@@ -6,6 +6,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-04
+
+### Changed
+- Simplified installation docs to recommend local PyPI execution with `uvx`.
+
+### Removed
+- Remote endpoint installation docs.
+
 ## [0.1.0] - 2026-04-15
 
 ### Added
@@ -19,7 +27,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Database built fresh on startup, torn down on shutdown; `ensure_fresh()` guards on each tool call.
 - Test suite with 115 tests covering both DB layer and server tools (88% coverage).
 - CI workflow with Codecov integration.
-- Prefect Horizon deployment support (writable temp directory for DB).
+- Writable temp-directory database cache for ephemeral runtimes.
 - Configuration module (`config.py`) for `DB_TTL_HOURS`, `MAX_RESULTS`, `MAX_RESULTS_CAP`, `MAX_SUMMARY_CODES`.
 
 ### Changed

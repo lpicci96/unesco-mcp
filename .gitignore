@@ -206,5 +206,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Agent files
+AGENTS.md
+CLAUDE.md
+
 /src/unesco_mcp/uis.db
 /identifier.sqlite

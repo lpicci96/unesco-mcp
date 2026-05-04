@@ -14,7 +14,6 @@ This server connects AI assistants to the [UIS API](https://api.uis.unesco.org/a
 to search indicators, retrieve data values, compare countries, and explore available breakdowns — all through natural conversation. 
 Data is cached locally in SQLite for fast indicator discovery, while live API calls fetch the actual data values.
 
-
 ## Available tools
 
 ### Discovery
@@ -115,4 +114,3 @@ Once installed, you can ask your AI assistant things like:
 - "Which countries have the highest out-of-school rates?"
 - "What education indicators are available broken down by sex and wealth quintile?"
 - "Show me the trend in secondary enrollment for Brazil over the last 10 years"
-

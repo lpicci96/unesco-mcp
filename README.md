@@ -52,40 +52,42 @@ Data is cached locally in SQLite for fast indicator discovery, while live API ca
 
 ## Installation
 
-### Hosted (recommended)
+### PyPI (recommended)
 
-The server is hosted on [Prefect Horizon](https://horizon.prefect.io) (free tier) — no local setup needed.
-Free tier usage may have limits; if you experience issues, consider [running locally](#local-from-source).
+Run the server locally from the published Python package. This requires Python 3.10+ and
+[`uv`](https://docs.astral.sh/uv/).
 
-Use this URL in any MCP-compatible client:
+**Claude Code:**
 
+```bash
+claude mcp add unesco-mcp -- uvx unesco-mcp
 ```
-https://unesco.fastmcp.app/mcp
-```
 
-For example, in Claude Desktop config:
+**Claude Desktop** — add to your config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
   "mcpServers": {
     "unesco-mcp": {
-      "url": "https://unesco.fastmcp.app/mcp"
+      "command": "uvx",
+      "args": ["unesco-mcp"]
     }
   }
 }
 ```
 
-Or in Claude Code:
-
-```bash
-claude mcp add unesco-mcp --url https://unesco.fastmcp.app/mcp
-```
-
 ### Local (from source)
 
-To run the server locally instead:
+Use this path when developing locally or testing unreleased changes:
 
-**Claude Desktop** — add to your config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+```bash
+git clone https://github.com/lucapicci/unesco-mcp.git
+cd unesco-mcp
+uv sync
+uv run unesco-mcp
+```
+
+For Claude Desktop, point the client at the checkout:
 
 ```json
 {
@@ -113,5 +115,4 @@ Once installed, you can ask your AI assistant things like:
 - "Which countries have the highest out-of-school rates?"
 - "What education indicators are available broken down by sex and wealth quintile?"
 - "Show me the trend in secondary enrollment for Brazil over the last 10 years"
-
 

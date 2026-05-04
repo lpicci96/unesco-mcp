@@ -80,7 +80,7 @@ claude mcp add unesco-mcp -- uvx unesco-mcp
 Use this path when developing locally or testing unreleased changes:
 
 ```bash
-git clone https://github.com/lucapicci/unesco-mcp.git
+git clone https://github.com/lpicci96/unesco-mcp.git
 cd unesco-mcp
 uv sync
 uv run unesco-mcp
